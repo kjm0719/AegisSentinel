@@ -1,0 +1,60 @@
+<Window x:Class="AegisSentinel.App.ThreatPromptWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AegisSentinel 긴급 보안 경고"
+        Height="510" Width="720"
+        WindowStartupLocation="Manual"
+        ShowActivated="False"
+        Topmost="True"
+        ResizeMode="NoResize"
+        Background="#0B111A"
+        Foreground="#F1F5F9">
+    <Border Margin="16" Background="#131C2A" BorderBrush="#EF4444" BorderThickness="1.5" CornerRadius="10" Padding="20">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Margin="0,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <Border Background="#7F1D1D" CornerRadius="6" Padding="10,4" Margin="0,0,8,0">
+                        <TextBlock x:Name="SeverityBadgeText" Text="CRITICAL" Foreground="#FCA5A5" FontWeight="Bold" FontSize="12"/>
+                    </Border>
+                    <Border Background="#1E293B" CornerRadius="6" Padding="10,4" Margin="0,0,10,0">
+                        <TextBlock x:Name="RiskScoreBadgeText" Text="RISK 90/100" Foreground="#38BDF8" FontWeight="Bold" FontSize="12"/>
+                    </Border>
+                    <TextBlock x:Name="StatusPillText" Text="프로세스 일시 정지됨 (NtSuspendProcess)"
+                               VerticalAlignment="Center" Foreground="#FBBF24" FontWeight="SemiBold" FontSize="13"/>
+                </StackPanel>
+                <Border x:Name="QueueBadgeBorder" Grid.Column="1" Background="#1E293B" BorderBrush="#38BDF8" BorderThickness="1" CornerRadius="6" Padding="8,4" Visibility="Collapsed">
+                    <TextBlock x:Name="QueueBadgeText" Text="" Foreground="#38BDF8" FontWeight="SemiBold" FontSize="11.5"/>
+                </Border>
+            </Grid>
+
+            <StackPanel Grid.Row="1" Margin="0,0,0,14">
+                <TextBlock x:Name="TitleText" Text="의심스러운 위협 행위 탐지" FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
+                <TextBlock x:Name="DescriptionText" Text="" Margin="0,6,0,0" Foreground="#CBD5E1" TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <Border Grid.Row="2" Background="#0B111A" BorderBrush="#263449" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,16">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <TextBlock x:Name="ProcessDetailText" FontFamily="Consolas" FontSize="12" Foreground="#E2E8F0" TextWrapping="Wrap"/>
+                </ScrollViewer>
+            </Border>
+
+            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="AllowOnceBtn" Content="1회 허용" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" Click="OnAllowOnceClick"/>
+                <Button x:Name="TrustBtn" Content="해시 신뢰 등록(변조감시)" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0" Click="OnTrustAndResumeClick"/>
+                <Button x:Name="FirewallBlockBtn" Content="방화벽 통신 차단" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" Click="OnFirewallBlockClick"/>
+                <Button x:Name="KillQuarantineBtn" Content="즉시 종료 및 격리" Style="{StaticResource DangerButton}" Click="OnKillAndQuarantineClick"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

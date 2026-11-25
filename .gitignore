@@ -1,0 +1,46 @@
+## .NET / Visual Studio / Rider / VS Code
+bin/
+obj/
+out/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+
+## Build & Publish Artifacts
+publish/
+artifacts/
+*.nupkg
+*.snupkg
+*.msix
+*.appx
+
+## Runtime / Local Forensic Outputs
+*.log
+*.jsonl
+*.snap
+*.quarantine
+*.hmac
+*.key
+policy.json
+intel.json
+malware_hashes.bin
+feed_domains.txt
+rules.local.json
+mitre_layer*.json
+forensic_report*.html
+Release_Updated/
+
+## OS Generated
+Thumbs.db
+Desktop.ini
+.DS_Store

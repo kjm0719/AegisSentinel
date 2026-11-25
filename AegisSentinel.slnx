@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AegisSentinel.App/AegisSentinel.App.csproj" />
+    <Project Path="src/AegisSentinel.Core/AegisSentinel.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AegisSentinel.Tests/AegisSentinel.Tests.csproj" />
+  </Folder>
+</Solution>
