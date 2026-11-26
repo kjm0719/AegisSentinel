@@ -61,7 +61,7 @@ public sealed class BehaviorRiskEngine
             state.Entries.RemoveAll(e => e.Time < cutoff);
 
             // Never stack the exact same signal name on the same PID; refresh timestamp and keep max weight.
-            // Only DISTINCT behavioral signals (e.g. DropPath + CredentialAccess + ExternalNetwork) sum together!
+            // Store ONLY raw timestamped signals; derived correlation bonuses are computed dynamically at evaluation time!
             var existingIdx = state.Entries.FindIndex(e => e.Signal.Equals(signalName, StringComparison.OrdinalIgnoreCase));
             if (existingIdx >= 0)
             {
@@ -83,16 +83,7 @@ public sealed class BehaviorRiskEngine
                 state.LastExternalNetwork = now;
             }
 
-            bool activeCred = state.LastCredentialAccess.HasValue && state.LastCredentialAccess.Value >= cutoff;
-            bool activeNet = state.LastExternalNetwork.HasValue && state.LastExternalNetwork.Value >= cutoff;
-            isExfilChain = activeCred && activeNet;
-            if (isExfilChain && !state.Entries.Any(e => e.Signal == "CredentialExfiltrationChain"))
-            {
-                state.Entries.Add((now, "CredentialExfiltrationChain", 45));
-            }
-
-            totalScore = Math.Min(100, state.Entries.Sum(e => e.Weight));
-            signals = state.Entries.Select(e => $"{e.Signal}(+{e.Weight})").ToList();
+            (totalScore, signals, isExfilChain) = EvaluateStateLocked(state, cutoff);
         }
 
         bool freeze = smartLowFrictionMode ? totalScore >= 75 : totalScore >= 55;
@@ -101,18 +92,18 @@ public sealed class BehaviorRiskEngine
         return new RiskAssessment(totalScore, signals, isExfilChain, freeze, prompt);
     }
 
-    public int GetCurrentScore(int pid)
+    public int GetCurrentScore(int pid, DateTimeOffset? nowOverride = null)
     {
         if (!_states.TryGetValue(pid, out var state))
         {
             return 0;
         }
 
-        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var cutoff = (nowOverride ?? DateTimeOffset.UtcNow).AddMinutes(-10);
         lock (state.Sync)
         {
-            state.Entries.RemoveAll(e => e.Time < cutoff);
-            return Math.Min(100, state.Entries.Sum(e => e.Weight));
+            var (score, _, _) = EvaluateStateLocked(state, cutoff);
+            return score;
         }
     }
 
@@ -120,7 +111,8 @@ public sealed class BehaviorRiskEngine
         int pid,
         int fallbackScore,
         IReadOnlyList<string> fallbackSignals,
-        bool smartLowFrictionMode = true)
+        bool smartLowFrictionMode = true,
+        DateTimeOffset? nowOverride = null)
     {
         if (pid <= 4 || !_states.TryGetValue(pid, out var state))
         {
@@ -133,18 +125,47 @@ public sealed class BehaviorRiskEngine
         int totalScore;
         List<string> signals;
         bool isExfilChain;
-        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var cutoff = (nowOverride ?? DateTimeOffset.UtcNow).AddMinutes(-10);
         lock (state.Sync)
         {
-            state.Entries.RemoveAll(e => e.Time < cutoff);
-            totalScore = Math.Max(fallbackScore, Math.Min(100, state.Entries.Sum(e => e.Weight)));
-            signals = state.Entries.Select(e => $"{e.Signal}(+{e.Weight})").ToList();
-            isExfilChain = state.LastCredentialAccess >= cutoff && state.LastExternalNetwork >= cutoff;
+            var (computedScore, computedSignals, exfil) = EvaluateStateLocked(state, cutoff);
+            totalScore = Math.Max(fallbackScore, computedScore);
+            signals = computedSignals;
+            isExfilChain = exfil;
         }
 
         bool freeze = smartLowFrictionMode ? totalScore >= 75 : totalScore >= 55;
         bool prompt = smartLowFrictionMode ? totalScore >= 75 : totalScore >= 50;
         return new RiskAssessment(totalScore, signals, isExfilChain, freeze, prompt);
+    }
+
+    private static (int TotalScore, List<string> Signals, bool IsExfilChain) EvaluateStateLocked(
+        ProcessRiskState state,
+        DateTimeOffset cutoff)
+    {
+        state.Entries.RemoveAll(e => e.Time < cutoff);
+        if (state.LastCredentialAccess.HasValue && state.LastCredentialAccess.Value < cutoff)
+        {
+            state.LastCredentialAccess = null;
+        }
+        if (state.LastExternalNetwork.HasValue && state.LastExternalNetwork.Value < cutoff)
+        {
+            state.LastExternalNetwork = null;
+        }
+
+        bool activeCred = state.LastCredentialAccess.HasValue && state.LastCredentialAccess.Value >= cutoff;
+        bool activeNet = state.LastExternalNetwork.HasValue && state.LastExternalNetwork.Value >= cutoff;
+        bool isExfilChain = activeCred && activeNet;
+
+        int rawScore = state.Entries.Sum(e => e.Weight) + (isExfilChain ? 45 : 0);
+        int totalScore = Math.Min(100, rawScore);
+        var signals = state.Entries.Select(e => $"{e.Signal}(+{e.Weight})").ToList();
+        if (isExfilChain)
+        {
+            signals.Add("CredentialExfiltrationChain(+45)");
+        }
+
+        return (totalScore, signals, isExfilChain);
     }
 
     public bool HasAccessedCredentials(int pid)

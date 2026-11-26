@@ -23,11 +23,16 @@ public sealed class QuarantineManager
 
     private readonly string _keyFilePath;
     private readonly object _keySync = new();
+    private readonly Func<string, bool>? _deleteFileOverride;
+    private readonly Func<string, bool>? _scheduleRebootDeleteOverride;
     private byte[]? _cachedAesKey;
 
     public string QuarantineDirectory { get; }
 
-    public QuarantineManager(string? baseDirectory = null)
+    public QuarantineManager(
+        string? baseDirectory = null,
+        Func<string, bool>? deleteFileOverride = null,
+        Func<string, bool>? scheduleRebootDeleteOverride = null)
     {
         var root = baseDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -35,6 +40,8 @@ public sealed class QuarantineManager
         QuarantineDirectory = Path.Combine(root, "Quarantine");
         Directory.CreateDirectory(QuarantineDirectory);
         _keyFilePath = Path.Combine(QuarantineDirectory, ".quarantine_aes.key");
+        _deleteFileOverride = deleteFileOverride;
+        _scheduleRebootDeleteOverride = scheduleRebootDeleteOverride;
     }
 
     private byte[] GetOrCreateAesKey()
@@ -171,15 +178,32 @@ public sealed class QuarantineManager
             throw;
         }
 
-        bool deletedImmediately = TryDeleteWithRetry(originalPath, maxAttempts: 5);
+        bool deletedImmediately = _deleteFileOverride is not null
+            ? _deleteFileOverride(originalPath)
+            : TryDeleteWithRetry(originalPath, maxAttempts: 5);
+
+        QuarantineDisposition disposition;
         string finalReason = reason;
-        if (!deletedImmediately)
+        if (deletedImmediately)
+        {
+            disposition = QuarantineDisposition.RemovedImmediately;
+        }
+        else
         {
             // Schedule automatic OS kernel deletion on next reboot before any user process starts
-            bool scheduled = Native.NativeMethods.MoveFileEx(originalPath, null, Native.NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
-            finalReason = scheduled
-                ? $"{reason} [사용 중 잠김 — 재부팅 시 OS 자동 삭제 예약됨]"
-                : $"{reason} [원본 잠금 상태로 격리 사본 보관됨]";
+            bool scheduled = _scheduleRebootDeleteOverride is not null
+                ? _scheduleRebootDeleteOverride(originalPath)
+                : Native.NativeMethods.MoveFileEx(originalPath, null, Native.NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
+            if (scheduled)
+            {
+                disposition = QuarantineDisposition.ScheduledDeleteOnReboot;
+                finalReason = $"{reason} [사용 중 잠김 — 재부팅 시 OS 자동 삭제 예약됨]";
+            }
+            else
+            {
+                disposition = QuarantineDisposition.CopyOnlyOriginalLocked;
+                finalReason = $"{reason} [원본 잠금 상태로 격리 사본만 보관됨 — 원본 미제거]";
+            }
         }
 
         var entry = new QuarantineEntry(
@@ -189,7 +213,8 @@ public sealed class QuarantineManager
             DateTimeOffset.Now,
             finalReason,
             sha256,
-            fileSize);
+            fileSize,
+            disposition);
 
         File.WriteAllText(metaPath, JsonSerializer.Serialize(entry, JsonOptions));
 

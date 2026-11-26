@@ -227,7 +227,7 @@ public partial class MainWindow : Window
                 _allEventRows.Insert(0, new SecurityEventRow(evt));
                 while (_allEventRows.Count > 1000) _allEventRows.RemoveAt(_allEventRows.Count - 1);
                 ApplyEventFilter();
-                if (evt.ActionTaken == SecurityActionTaken.Quarantined)
+                if (evt.ActionTaken is SecurityActionTaken.Quarantined or SecurityActionTaken.QuarantinePendingReboot or SecurityActionTaken.QuarantineCopyOnly)
                 {
                     RefreshQuarantineList();
                 }

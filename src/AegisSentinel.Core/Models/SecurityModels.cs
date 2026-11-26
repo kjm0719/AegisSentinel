@@ -41,9 +41,18 @@ public enum SecurityActionTaken
     Suspended,
     Terminated,
     Quarantined,
+    QuarantinePendingReboot,
+    QuarantineCopyOnly,
     FirewallBlocked,
     RolledBack,
     Allowed
+}
+
+public enum QuarantineDisposition
+{
+    RemovedImmediately,
+    ScheduledDeleteOnReboot,
+    CopyOnlyOriginalLocked
 }
 
 public enum SignatureStatus
@@ -108,8 +117,13 @@ public sealed class SecurityEvent
     public List<string> RiskSignals { get; init; } = new();
     public SignatureInfo? Signature { get; set; }
     public bool IsProcessSuspended { get; set; }
+    public List<int> SuspendedChildProcessIds { get; set; } = new();
+    public int AttemptedChildFreezeCount { get; set; }
+    public bool? ProcessTerminationSucceeded { get; set; }
+    public QuarantineDisposition? QuarantineDisposition { get; set; }
+    public string ContainmentDetail { get; set; } = string.Empty;
     public bool IsRiskAlreadyCorrelated { get; set; }
-    public bool CanIntervene => ProcessId > 4 && (IsProcessSuspended || !string.IsNullOrEmpty(TargetPath) || !string.IsNullOrEmpty(ProcessPath));
+    public bool CanIntervene => ProcessId > 4 && (IsProcessSuspended || SuspendedChildProcessIds.Count > 0 || !string.IsNullOrEmpty(TargetPath) || !string.IsNullOrEmpty(ProcessPath));
 
     public void EnsureMitrePopulated()
     {
@@ -304,7 +318,8 @@ public sealed record QuarantineEntry(
     DateTimeOffset QuarantinedAt,
     string Reason,
     string Sha256,
-    long FileSize);
+    long FileSize,
+    QuarantineDisposition Disposition = QuarantineDisposition.RemovedImmediately);
 
 public sealed record VaultSnapshotEntry(
     string Id,

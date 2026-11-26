@@ -123,28 +123,48 @@ public sealed class ProcessController
         }
     }
 
+    public sealed record ProcessTreeSuspensionResult(
+        int RootPid,
+        bool RootSuspended,
+        IReadOnlyList<int> SuspendedChildPids,
+        int AttemptedChildCount)
+    {
+        public int TotalSuspendedCount => (RootSuspended ? 1 : 0) + SuspendedChildPids.Count;
+        public bool AnySuspended => TotalSuspendedCount > 0;
+    }
+
+    private readonly Func<int, bool>? _suspendPidOverride;
+
+    public ProcessController(Func<int, bool>? suspendPidOverride = null)
+    {
+        _suspendPidOverride = suspendPidOverride;
+    }
+
     /// <summary>
     /// Suspends both the offending root process and any non-critical descendant processes
-    /// it spawned so a malicious process tree cannot keep operating via child workers.
+    /// it spawned, returning exact per-process results so callers never misreport partial freezes.
     /// </summary>
-    public int TrySuspendProcessTree(int rootPid, IEnumerable<int> descendantPids)
+    public ProcessTreeSuspensionResult TrySuspendProcessTreeDetailed(int rootPid, IEnumerable<int> descendantPids)
     {
-        int frozen = 0;
-        if (TrySuspendProcess(rootPid))
-        {
-            frozen++;
-        }
+        bool rootSuspended = TrySuspendProcess(rootPid);
+        var suspendedChildren = new List<int>();
+        int attemptedChildren = 0;
 
-        foreach (var childPid in descendantPids)
+        foreach (var childPid in descendantPids.Distinct())
         {
-            if (childPid != rootPid && TrySuspendProcess(childPid))
+            if (childPid == rootPid || childPid <= 4) continue;
+            attemptedChildren++;
+            if (TrySuspendProcess(childPid))
             {
-                frozen++;
+                suspendedChildren.Add(childPid);
             }
         }
 
-        return frozen;
+        return new ProcessTreeSuspensionResult(rootPid, rootSuspended, suspendedChildren, attemptedChildren);
     }
+
+    public int TrySuspendProcessTree(int rootPid, IEnumerable<int> descendantPids) =>
+        TrySuspendProcessTreeDetailed(rootPid, descendantPids).TotalSuspendedCount;
 
     public int TryResumeProcessTree(int rootPid, IEnumerable<int> descendantPids)
     {
@@ -180,6 +200,13 @@ public sealed class ProcessController
 
     public bool TrySuspendProcess(int pid)
     {
+        if (_suspendPidOverride is not null)
+        {
+            bool ok = _suspendPidOverride(pid);
+            if (ok) _suspendedPids[pid] = 1;
+            return ok;
+        }
+
         if (IsCriticalProtectedProcess(pid))
         {
             return false;

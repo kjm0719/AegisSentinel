@@ -36,7 +36,8 @@ public sealed class SecurityOrchestrator : IDisposable
     private readonly EtwDnsTelemetryService _etwDnsService;
     private readonly FallbackProcessAndFileMonitor _fallbackMonitor;
 
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _dedupCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (DateTimeOffset LastSeen, int LastRiskScore)> _dedupCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _dedupLock = new();
     private readonly ConcurrentDictionary<int, (string ProcessPath, DateTimeOffset AllowedAt)> _sessionAllowedPids = new();
     private readonly ConcurrentDictionary<int, byte> _activeInterventionPids = new();
     private readonly object _lifecycleLock = new();
@@ -65,6 +66,7 @@ public sealed class SecurityOrchestrator : IDisposable
     public NetworkGuardMonitor NetworkGuard => _networkGuard;
     public PersistenceMonitor Persistence => _persistenceMonitor;
     public ProcessController ProcessControl => _processController;
+    public ProcessTreeTracker TreeTracker => _treeTracker;
     public CanaryManager Canaries => _canaryManager;
     public BehaviorRiskEngine RiskEngine => _riskEngine;
     public CustomRuleEngine CustomRules => _customRuleEngine;
@@ -75,15 +77,18 @@ public sealed class SecurityOrchestrator : IDisposable
     public event Action<string>? EngineStatusMessage;
     public event Action<string>? DatabaseUpdated;
 
-    public SecurityOrchestrator(PolicyStore? policyStore = null)
+    public SecurityOrchestrator(
+        PolicyStore? policyStore = null,
+        ProcessController? processController = null,
+        QuarantineManager? quarantineManager = null)
     {
         _policyStore = policyStore ?? new PolicyStore();
         _policy = _policyStore.Load();
 
-        _processController = new ProcessController();
+        _processController = processController ?? new ProcessController();
         _signatureVerifier = new SignatureVerifier();
         _intelStore = new ThreatIntelStore(_policyStore.BaseDirectory);
-        _quarantineManager = new QuarantineManager(_policyStore.BaseDirectory);
+        _quarantineManager = quarantineManager ?? new QuarantineManager(_policyStore.BaseDirectory);
         _recoveryVault = new RecoveryVault(_policyStore.BaseDirectory, _policyStore.Signer);
         _auditLog = new AuditLogService(_policyStore.BaseDirectory);
         _treeTracker = new ProcessTreeTracker();
@@ -418,8 +423,19 @@ public sealed class SecurityOrchestrator : IDisposable
             _policyStore.Save(updated);
         }
 
-        var descendants = evt.ProcessId > 4 ? _treeTracker.GetDescendantPids(evt.ProcessId) : Array.Empty<int>();
-        foreach (var childPid in descendants)
+        // Resume ONLY the root (if suspended) and actually-suspended children recorded on the event or tracked by ProcessController
+        var childPidsToResume = new HashSet<int>(evt.SuspendedChildProcessIds);
+        if (evt.ProcessId > 4)
+        {
+            foreach (var d in _treeTracker.GetDescendantPids(evt.ProcessId))
+            {
+                if (_processController.IsProcessSuspendedByUs(d))
+                {
+                    childPidsToResume.Add(d);
+                }
+            }
+        }
+        foreach (var childPid in childPidsToResume)
         {
             var childPath = _processController.GetExecutablePath(childPid);
             if (grantSessionImmunity && !string.IsNullOrWhiteSpace(childPath))
@@ -430,8 +446,10 @@ public sealed class SecurityOrchestrator : IDisposable
             _riskEngine.ClearProcess(childPid);
         }
 
-        bool resumed = evt.ProcessId > 4 && _processController.TryResumeProcessTree(evt.ProcessId, descendants) > 0;
+        bool resumed = (evt.ProcessId > 4 || childPidsToResume.Count > 0) &&
+                       _processController.TryResumeProcessTree(evt.ProcessId, childPidsToResume) > 0;
         evt.IsProcessSuspended = false;
+        evt.SuspendedChildProcessIds.Clear();
         evt.ActionTaken = SecurityActionTaken.Allowed;
         return resumed;
     }
@@ -470,8 +488,11 @@ public sealed class SecurityOrchestrator : IDisposable
 
     public bool KillAndQuarantine(SecurityEvent evt)
     {
-        bool killed = evt.ProcessId <= 4;
-        if (evt.ProcessId > 4)
+        bool hasTargetProcess = evt.ProcessId > 4;
+        bool killed = false;
+        var detailParts = new List<string>();
+
+        if (hasTargetProcess)
         {
             // PID-reuse guard: never kill an innocent process if Windows recycled a historical event's PID!
             var livePath = _processController.GetExecutablePath(evt.ProcessId);
@@ -483,7 +504,8 @@ public sealed class SecurityOrchestrator : IDisposable
 
             if (pidStillMatchesEvent)
             {
-                var descendants = _treeTracker.GetDescendantPids(evt.ProcessId);
+                var descendants = new HashSet<int>(_treeTracker.GetDescendantPids(evt.ProcessId));
+                foreach (var suspendedChild in evt.SuspendedChildProcessIds) descendants.Add(suspendedChild);
                 foreach (var childPid in descendants)
                 {
                     _activeInterventionPids.TryRemove(childPid, out _);
@@ -492,8 +514,12 @@ public sealed class SecurityOrchestrator : IDisposable
                 }
                 killed = _processController.TryTerminateProcess(evt.ProcessId);
             }
+
+            evt.ProcessTerminationSucceeded = killed;
+            detailParts.Add(killed ? $"프로세스(PID {evt.ProcessId}) 종료 완료" : $"프로세스(PID {evt.ProcessId}) 종료 실패/미실행");
         }
         evt.IsProcessSuspended = false;
+        evt.SuspendedChildProcessIds.Clear();
 
         // TargetPath is only the malicious file for static file / DLL / USB drops.
         // For behavioral process attacks (Ransomware, CredentialAccess, SupplyChain, etc.),
@@ -509,18 +535,39 @@ public sealed class SecurityOrchestrator : IDisposable
             ? evt.TargetPath
             : (!string.IsNullOrWhiteSpace(evt.ProcessPath) && File.Exists(evt.ProcessPath) ? evt.ProcessPath : string.Empty);
 
-        bool quarantined = false;
+        bool quarantineRemovedOrScheduled = false;
+        QuarantineDisposition? qDisposition = null;
         if (!string.IsNullOrWhiteSpace(fileToQuarantine) &&
             !IsProtectedWindowsSystemBinary(fileToQuarantine) &&
             !IsProtectedUserDocumentOrCredential(fileToQuarantine))
         {
             try
             {
-                _quarantineManager.QuarantineFile(fileToQuarantine, evt.Title);
-                quarantined = true;
-                evt.ActionTaken = SecurityActionTaken.Quarantined;
+                var qEntry = _quarantineManager.QuarantineFile(fileToQuarantine, evt.Title);
+                qDisposition = qEntry.Disposition;
+                evt.QuarantineDisposition = qEntry.Disposition;
+                switch (qEntry.Disposition)
+                {
+                    case QuarantineDisposition.RemovedImmediately:
+                        quarantineRemovedOrScheduled = true;
+                        evt.ActionTaken = SecurityActionTaken.Quarantined;
+                        detailParts.Add("원본 제거 및 AES-256-GCM 격리 완료");
+                        break;
+                    case QuarantineDisposition.ScheduledDeleteOnReboot:
+                        quarantineRemovedOrScheduled = true;
+                        evt.ActionTaken = SecurityActionTaken.QuarantinePendingReboot;
+                        detailParts.Add("격리 사본 보관 완료 · 원본은 재부팅 시 OS 자동 삭제 예약됨");
+                        break;
+                    case QuarantineDisposition.CopyOnlyOriginalLocked:
+                        quarantineRemovedOrScheduled = false;
+                        detailParts.Add("원본 파일 잠금으로 격리 사본만 보관됨 (원본 미제거)");
+                        break;
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                detailParts.Add($"격리 실패({ex.Message})");
+            }
         }
 
         bool rolledBack = false;
@@ -531,7 +578,8 @@ public sealed class SecurityOrchestrator : IDisposable
             if (SystemIntegrityGuard.TryDisableHijackedProxy())
             {
                 rolledBack = true;
-                if (!quarantined) evt.ActionTaken = SecurityActionTaken.RolledBack;
+                detailParts.Add("프록시 설정 롤백 완료");
+                if (!quarantineRemovedOrScheduled) evt.ActionTaken = SecurityActionTaken.RolledBack;
             }
         }
 
@@ -545,18 +593,32 @@ public sealed class SecurityOrchestrator : IDisposable
                 if (PersistenceMonitor.TryRollbackEntry(loc, name))
                 {
                     rolledBack = true;
-                    if (!quarantined) evt.ActionTaken = SecurityActionTaken.RolledBack;
+                    detailParts.Add("지속성 항목 롤백 완료");
+                    if (!quarantineRemovedOrScheduled) evt.ActionTaken = SecurityActionTaken.RolledBack;
                 }
             }
         }
 
-        if (quarantined || rolledBack)
+        if (detailParts.Count > 0)
+        {
+            evt.ContainmentDetail = string.Join(" | ", detailParts);
+        }
+
+        if (quarantineRemovedOrScheduled || rolledBack)
         {
             return true;
         }
 
-        evt.ActionTaken = killed ? SecurityActionTaken.Terminated : SecurityActionTaken.Logged;
-        return killed;
+        if (hasTargetProcess && killed)
+        {
+            evt.ActionTaken = SecurityActionTaken.Terminated;
+            return true;
+        }
+
+        evt.ActionTaken = qDisposition == QuarantineDisposition.CopyOnlyOriginalLocked
+            ? SecurityActionTaken.QuarantineCopyOnly
+            : SecurityActionTaken.Logged;
+        return false;
     }
 
     private void SweepSuspiciousProcessMemory()
@@ -721,14 +783,6 @@ public sealed class SecurityOrchestrator : IDisposable
             evt.ProcessAncestry = _treeTracker.FormatAncestryString(evt.ProcessId);
         }
 
-        var dedupKey = $"{evt.Category}|{evt.ProcessId}|{evt.TargetPath}|{evt.RemoteEndpoint}|{evt.Title}";
-        if (_dedupCache.TryGetValue(dedupKey, out var lastSeen) && (now - lastSeen).TotalSeconds < 5)
-        {
-            return;
-        }
-        _dedupCache[dedupKey] = now;
-        if (_dedupCache.Count > 1000) _dedupCache.Clear();
-
         int baseWeight = evt.RiskScore > 0 ? evt.RiskScore : evt.Severity switch
         {
             ThreatSeverity.Critical => 90,
@@ -736,6 +790,14 @@ public sealed class SecurityOrchestrator : IDisposable
             ThreatSeverity.Medium => 40,
             _ => 20
         };
+
+        // Atomic 5-second deduplication gate: allows strictly one concurrent caller per key,
+        // still admits a higher-risk escalation for the same key, and prunes only expired keys!
+        var dedupKey = $"{evt.Category}|{evt.ProcessId}|{evt.TargetPath}|{evt.RemoteEndpoint}|{evt.Title}";
+        if (!TryAcquireEventDedupGate(dedupKey, baseWeight, now))
+        {
+            return;
+        }
 
         RiskAssessment assessment;
         if (evt.IsRiskAlreadyCorrelated)
@@ -787,9 +849,12 @@ public sealed class SecurityOrchestrator : IDisposable
             if (_policy.Mode == ProtectionMode.Strict &&
                 (evt.Signature is null || !evt.Signature.IsSigned))
             {
-                if (_processController.TrySuspendProcessTree(evt.ProcessId, descendants) > 0)
+                var strictFreeze = _processController.TrySuspendProcessTreeDetailed(evt.ProcessId, descendants);
+                if (strictFreeze.AnySuspended)
                 {
                     _metrics.IncrementProcessFrozen();
+                    evt.SuspendedChildProcessIds = strictFreeze.SuspendedChildPids.ToList();
+                    evt.AttemptedChildFreezeCount = strictFreeze.AttemptedChildCount;
                 }
                 KillAndQuarantine(evt);
                 if (!string.IsNullOrWhiteSpace(evt.ProcessPath) && File.Exists(evt.ProcessPath))
@@ -801,15 +866,32 @@ public sealed class SecurityOrchestrator : IDisposable
                 return;
             }
 
-            if (_processController.TrySuspendProcessTree(evt.ProcessId, descendants) > 0)
+            var freezeResult = _processController.TrySuspendProcessTreeDetailed(evt.ProcessId, descendants);
+            evt.IsProcessSuspended = freezeResult.RootSuspended;
+            evt.SuspendedChildProcessIds = freezeResult.SuspendedChildPids.ToList();
+            evt.AttemptedChildFreezeCount = freezeResult.AttemptedChildCount;
+
+            if (freezeResult.AnySuspended)
             {
                 _metrics.IncrementProcessFrozen();
-                evt.IsProcessSuspended = true;
-                evt.ActionTaken = SecurityActionTaken.Suspended;
-                foreach (var childPid in descendants)
+                // Track ONLY children that were actually frozen — never blind telemetry for failed/running children!
+                foreach (var frozenChildPid in freezeResult.SuspendedChildPids)
                 {
-                    _activeInterventionPids.TryAdd(childPid, 1);
+                    _activeInterventionPids.TryAdd(frozenChildPid, 1);
                 }
+            }
+
+            if (freezeResult.RootSuspended)
+            {
+                evt.ActionTaken = SecurityActionTaken.Suspended;
+                evt.ContainmentDetail = freezeResult.AttemptedChildCount > 0
+                    ? $"부모 동결 완료 · 자식 {freezeResult.SuspendedChildPids.Count}/{freezeResult.AttemptedChildCount}개 동결"
+                    : "프로세스 즉시 동결 완료";
+            }
+            else if (freezeResult.SuspendedChildPids.Count > 0)
+            {
+                evt.ActionTaken = SecurityActionTaken.Logged;
+                evt.ContainmentDetail = $"부분 동결 주의: 부모(PID {evt.ProcessId}) 실행 중 · 자식 {freezeResult.SuspendedChildPids.Count}/{freezeResult.AttemptedChildCount}개만 동결됨";
             }
         }
 
@@ -821,8 +903,14 @@ public sealed class SecurityOrchestrator : IDisposable
         {
             try
             {
-                _quarantineManager.QuarantineFile(evt.TargetPath, evt.Title);
-                evt.ActionTaken = SecurityActionTaken.Quarantined;
+                var qEntry = _quarantineManager.QuarantineFile(evt.TargetPath, evt.Title);
+                evt.QuarantineDisposition = qEntry.Disposition;
+                evt.ActionTaken = qEntry.Disposition switch
+                {
+                    QuarantineDisposition.RemovedImmediately => SecurityActionTaken.Quarantined,
+                    QuarantineDisposition.ScheduledDeleteOnReboot => SecurityActionTaken.QuarantinePendingReboot,
+                    _ => SecurityActionTaken.QuarantineCopyOnly
+                };
             }
             catch { }
         }
@@ -839,6 +927,58 @@ public sealed class SecurityOrchestrator : IDisposable
             {
                 try { UserInterventionRequired?.Invoke(evt); } catch { }
             }
+        }
+    }
+
+    private bool TryAcquireEventDedupGate(string dedupKey, int incomingRiskScore, DateTimeOffset now)
+    {
+        lock (_dedupLock)
+        {
+            if (_dedupCache.TryGetValue(dedupKey, out var existing) &&
+                (now - existing.LastSeen).TotalSeconds < 5)
+            {
+                if (incomingRiskScore > existing.LastRiskScore)
+                {
+                    _dedupCache[dedupKey] = (now, incomingRiskScore);
+                    return true;
+                }
+                return false;
+            }
+
+            _dedupCache[dedupKey] = (now, incomingRiskScore);
+
+            if (_dedupCache.Count > 1000)
+            {
+                var cutoff = now.AddSeconds(-5);
+                var expiredKeys = new List<string>();
+                foreach (var kvp in _dedupCache)
+                {
+                    if (kvp.Value.LastSeen < cutoff)
+                    {
+                        expiredKeys.Add(kvp.Key);
+                    }
+                }
+                foreach (var k in expiredKeys)
+                {
+                    _dedupCache.Remove(k);
+                }
+
+                // If burst traffic still exceeds cap within a single 5s window, evict only the oldest entries
+                if (_dedupCache.Count > 2000)
+                {
+                    var oldest = _dedupCache
+                        .OrderBy(k => k.Value.LastSeen)
+                        .Take(_dedupCache.Count - 1000)
+                        .Select(k => k.Key)
+                        .ToList();
+                    foreach (var k in oldest)
+                    {
+                        _dedupCache.Remove(k);
+                    }
+                }
+            }
+
+            return true;
         }
     }
 

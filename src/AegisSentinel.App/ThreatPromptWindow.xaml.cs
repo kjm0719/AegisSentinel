@@ -31,9 +31,20 @@ public partial class ThreatPromptWindow : Window
 
         SeverityBadgeText.Text = $"{securityEvent.Severity.ToString().ToUpperInvariant()} | {securityEvent.MitreTechniqueId}";
         RiskScoreBadgeText.Text = $"RISK {securityEvent.RiskScore}/100";
-        StatusPillText.Text = securityEvent.IsProcessSuspended
-            ? "프로세스 즉시 일시정지됨 (동결 상태 — 안전 확보)"
-            : "실시간 상관분석 보안 경고";
+        if (securityEvent.IsProcessSuspended)
+        {
+            StatusPillText.Text = securityEvent.AttemptedChildFreezeCount > 0
+                ? $"프로세스 트리 일시정지됨 (부모 + 자식 {securityEvent.SuspendedChildProcessIds.Count}/{securityEvent.AttemptedChildFreezeCount}개 동결)"
+                : "프로세스 즉시 일시정지됨 (동결 상태 — 안전 확보)";
+        }
+        else if (securityEvent.SuspendedChildProcessIds.Count > 0)
+        {
+            StatusPillText.Text = $"부분 동결 주의 — 부모 실행 중 · 자식 {securityEvent.SuspendedChildProcessIds.Count}/{securityEvent.AttemptedChildFreezeCount}개만 동결됨";
+        }
+        else
+        {
+            StatusPillText.Text = "실시간 상관분석 보안 경고";
+        }
         TitleText.Text = securityEvent.Title;
         DescriptionText.Text = securityEvent.Description;
 
@@ -69,6 +80,10 @@ public partial class ThreatPromptWindow : Window
         if (!string.IsNullOrWhiteSpace(securityEvent.TargetPath))
         {
             sb.AppendLine($"대상 경로 : {securityEvent.TargetPath}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.ContainmentDetail))
+        {
+            sb.AppendLine($"대응 상태 : {securityEvent.ContainmentDetail}");
         }
 
         ProcessDetailText.Text = sb.ToString();

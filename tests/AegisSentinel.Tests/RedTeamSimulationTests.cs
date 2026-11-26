@@ -2080,4 +2080,169 @@ public sealed class RedTeamSimulationTests : IDisposable
         var signedImporterRes = SignaturePatternScanner.ScanBytes(signedImporterBytes, isSigned: true, ".dll", isMicrosoftSigned: false);
         Assert.False(signedImporterRes.IsMatched);
     }
+
+    [Fact]
+    public void PeerReviewFixes_QuarantineDisposition_PartialTreeFreeze_DynamicExfilExpiry_And_AtomicDedup()
+    {
+        var prDir = Path.Combine(_tempRoot, "peer_review_fixes");
+        Directory.CreateDirectory(prDir);
+
+        // 1. Quarantine copy-only (original delete failed + reboot-delete scheduling failed) MUST NOT claim Quarantined!
+        var lockedFile = Path.Combine(prDir, "locked_malware.exe");
+        File.WriteAllBytes(lockedFile, new byte[] { 0x4D, 0x5A, 0x90, 0x00, 0x11, 0x22 });
+        var copyOnlyQm = new QuarantineManager(
+            prDir,
+            deleteFileOverride: _ => false,
+            scheduleRebootDeleteOverride: _ => false);
+        var copyStore = new PolicyStore(prDir);
+        using var copyOrch = new SecurityOrchestrator(copyStore, quarantineManager: copyOnlyQm);
+
+        var copyEvt = new SecurityEvent
+        {
+            ProcessId = 0,
+            Category = ThreatCategory.StaticMalware,
+            Severity = ThreatSeverity.Critical,
+            TargetPath = lockedFile,
+            Title = "Locked Malware Copy-Only Test"
+        };
+        bool copyOk = copyOrch.KillAndQuarantine(copyEvt);
+        Assert.False(copyOk);
+        Assert.Equal(QuarantineDisposition.CopyOnlyOriginalLocked, copyEvt.QuarantineDisposition);
+        Assert.Equal(SecurityActionTaken.QuarantineCopyOnly, copyEvt.ActionTaken);
+        Assert.True(File.Exists(lockedFile), "Original locked file remains on disk as simulated");
+
+        // Reboot-scheduled deletion reports QuarantinePendingReboot distinctly from immediate removal
+        var rebootQm = new QuarantineManager(
+            prDir,
+            deleteFileOverride: _ => false,
+            scheduleRebootDeleteOverride: _ => true);
+        using var rebootOrch = new SecurityOrchestrator(copyStore, quarantineManager: rebootQm);
+        var rebootEvt = new SecurityEvent
+        {
+            ProcessId = 0,
+            Category = ThreatCategory.StaticMalware,
+            Severity = ThreatSeverity.Critical,
+            TargetPath = lockedFile,
+            Title = "Locked Malware Reboot-Scheduled Test"
+        };
+        bool rebootOk = rebootOrch.KillAndQuarantine(rebootEvt);
+        Assert.True(rebootOk);
+        Assert.Equal(QuarantineDisposition.ScheduledDeleteOnReboot, rebootEvt.QuarantineDisposition);
+        Assert.Equal(SecurityActionTaken.QuarantinePendingReboot, rebootEvt.ActionTaken);
+
+        // 2. Partial process-tree freeze: root fails (77100), child1 succeeds (77101), child2 fails (77102).
+        //    Root event MUST NOT claim IsProcessSuspended=true, and unfrozen child2 MUST NOT be blinded in _activeInterventionPids!
+        var partialProcCtrl = new ProcessController(suspendPidOverride: pid => pid == 77101);
+        using var partialOrch = new SecurityOrchestrator(copyStore, processController: partialProcCtrl);
+        partialOrch.TreeTracker.RecordStart(77100, 1000, "parent_mal", @"C:\Temp\parent_mal.exe", "");
+        partialOrch.TreeTracker.RecordStart(77101, 77100, "child_frozen", @"C:\Temp\child_frozen.exe", "");
+        partialOrch.TreeTracker.RecordStart(77102, 77100, "child_alive", @"C:\Temp\child_alive.exe", "");
+
+        var recordedPartial = new List<SecurityEvent>();
+        partialOrch.EventRecorded += e => recordedPartial.Add(e);
+
+        var parentEvt = new SecurityEvent
+        {
+            ProcessId = 77100,
+            ProcessName = "parent_mal",
+            ProcessPath = @"C:\Temp\parent_mal.exe",
+            Category = ThreatCategory.Ransomware,
+            Severity = ThreatSeverity.Critical,
+            RiskScore = 95,
+            Title = "Partial Freeze Root Threat"
+        };
+        partialOrch.ProcessSecurityEvent(parentEvt);
+
+        Assert.False(parentEvt.IsProcessSuspended);
+        Assert.Equal(SecurityActionTaken.Logged, parentEvt.ActionTaken);
+        Assert.Equal(2, parentEvt.AttemptedChildFreezeCount);
+        Assert.Single(parentEvt.SuspendedChildProcessIds);
+        Assert.Equal(77101, parentEvt.SuspendedChildProcessIds[0]);
+        Assert.Contains("1/2", parentEvt.ContainmentDetail);
+
+        // Frozen child 77101 is suppressed while awaiting intervention, but STILL-RUNNING child 77102 is NOT suppressed!
+        int countBeforeChildFollowups = recordedPartial.Count;
+        partialOrch.ProcessSecurityEvent(new SecurityEvent
+        {
+            ProcessId = 77101,
+            ProcessName = "child_frozen",
+            ProcessPath = @"C:\Temp\child_frozen.exe",
+            Category = ThreatCategory.NetworkAnomaly,
+            Severity = ThreatSeverity.High,
+            RiskScore = 80,
+            Title = "Followup From Frozen Child"
+        });
+        Assert.Equal(countBeforeChildFollowups, recordedPartial.Count);
+
+        partialOrch.ProcessSecurityEvent(new SecurityEvent
+        {
+            ProcessId = 77102,
+            ProcessName = "child_alive",
+            ProcessPath = @"C:\Temp\child_alive.exe",
+            Category = ThreatCategory.NetworkAnomaly,
+            Severity = ThreatSeverity.High,
+            RiskScore = 80,
+            Title = "Followup From Still-Running Child"
+        });
+        Assert.Equal(countBeforeChildFollowups + 1, recordedPartial.Count);
+
+        // 3. Dynamic CredentialExfiltrationChain (+45) bonus MUST expire immediately when either underlying evidence expires!
+        var risk = new BehaviorRiskEngine();
+        var t0 = new DateTimeOffset(2026, 11, 26, 12, 0, 0, TimeSpan.Zero);
+        var at0 = risk.RecordSignal(88001, "BrowserCredRead", 35, marksCredentialAccess: true, nowOverride: t0);
+        Assert.False(at0.IsExfiltrationChain);
+        Assert.Equal(35, at0.TotalScore);
+
+        var at9 = risk.RecordSignal(88001, "ExternalHttps", 25, marksExternalNetwork: true, nowOverride: t0.AddMinutes(9));
+        Assert.True(at9.IsExfiltrationChain);
+        Assert.Equal(100, at9.TotalScore); // 35 + 25 + 45 = 105 -> clamped 100
+        Assert.Contains(at9.Signals, s => s.StartsWith("CredentialExfiltrationChain(", StringComparison.Ordinal));
+
+        // At t=11 min: t=0 credential access expired (>10m), so bonus MUST disappear alongside IsExfiltrationChain=false!
+        var at11 = risk.RecordSignal(88001, "MinorActivity", 10, nowOverride: t0.AddMinutes(11));
+        Assert.False(at11.IsExfiltrationChain);
+        Assert.DoesNotContain(at11.Signals, s => s.StartsWith("CredentialExfiltrationChain", StringComparison.Ordinal));
+        Assert.Equal(35, at11.TotalScore); // 25 (at t=9) + 10 (at t=11) = 35, zero ghost +45 bonus!
+        Assert.Equal(35, risk.GetCurrentScore(88001, nowOverride: t0.AddMinutes(11)));
+        var assessed11 = risk.GetCurrentAssessment(88001, 0, Array.Empty<string>(), nowOverride: t0.AddMinutes(11));
+        Assert.False(assessed11.IsExfiltrationChain);
+        Assert.Equal(35, assessed11.TotalScore);
+
+        // 4. Atomic concurrent deduplication: 16 simultaneous identical events record strictly ONCE,
+        //    and a higher-risk escalation on the same key within 5s is still admitted!
+        var dedupDir = Path.Combine(prDir, "dedup_test");
+        Directory.CreateDirectory(dedupDir);
+        var dedupStore = new PolicyStore(dedupDir);
+        using var dedupOrch = new SecurityOrchestrator(dedupStore);
+        int recordedCount = 0;
+        dedupOrch.EventRecorded += _ => Interlocked.Increment(ref recordedCount);
+
+        Parallel.For(0, 16, _ =>
+        {
+            dedupOrch.ProcessSecurityEvent(new SecurityEvent
+            {
+                ProcessId = 0,
+                Category = ThreatCategory.NetworkAnomaly,
+                Severity = ThreatSeverity.Medium,
+                RiskScore = 40,
+                TargetPath = @"C:\Temp\dup_test.exe",
+                RemoteEndpoint = "198.51.100.10:443",
+                Title = "Concurrent Identical Event"
+            });
+        });
+        Assert.Equal(1, Volatile.Read(ref recordedCount));
+
+        // Escalated risk score on the exact same key within 5s is admitted rather than silently dropped
+        dedupOrch.ProcessSecurityEvent(new SecurityEvent
+        {
+            ProcessId = 0,
+            Category = ThreatCategory.NetworkAnomaly,
+            Severity = ThreatSeverity.Critical,
+            RiskScore = 90,
+            TargetPath = @"C:\Temp\dup_test.exe",
+            RemoteEndpoint = "198.51.100.10:443",
+            Title = "Concurrent Identical Event"
+        });
+        Assert.Equal(2, Volatile.Read(ref recordedCount));
+    }
 }
