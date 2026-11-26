@@ -63,7 +63,8 @@ public enum QuarantineRestoreStatus
     DestinationConflict,
     IntegrityCheckFailed,
     NotFoundOrInvalid,
-    WriteFailed
+    WriteFailed,
+    RestoredButRebootDeleteCancelFailed
 }
 
 public sealed record QuarantineRestoreResult(
@@ -108,6 +109,41 @@ public sealed record ProcessTreeResumeResult(
         RootStatus == ProcessResumeStatus.Resumed ||
         ChildResults.Any(r => r.Status == ProcessResumeStatus.Resumed);
     public bool AllCleared => !HasAnyPendingRetry;
+}
+
+public enum ProcessTerminationStatus
+{
+    Terminated,
+    AlreadyExitedOrReplaced,
+    ProtectedProcessSkipped,
+    TransientFailureRetryRequired
+}
+
+public sealed record ProcessTerminationItemResult(
+    int ProcessId,
+    ProcessTerminationStatus Status,
+    bool StillSuspendedByUs,
+    string Detail = "");
+
+public sealed record KillAndQuarantineResult(
+    bool RootTerminated,
+    ProcessTerminationStatus? RootStatus,
+    bool RootStillSuspended,
+    IReadOnlyList<ProcessTerminationItemResult> ChildResults,
+    bool QuarantineRemovedOrScheduled,
+    QuarantineDisposition? QuarantineDisposition,
+    bool RolledBack,
+    bool OverallSuccess)
+{
+    public IReadOnlyList<int> RemainingSuspendedChildPids =>
+        ChildResults
+            .Where(r => r.StillSuspendedByUs || r.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
+            .Select(r => r.ProcessId)
+            .Distinct()
+            .ToList();
+
+    public bool HasAnyPendingFrozenProcess =>
+        RootStillSuspended || RemainingSuspendedChildPids.Count > 0;
 }
 
 public enum SignatureStatus

@@ -66,9 +66,18 @@ public partial class App : System.Windows.Application, IDisposable
             updateActiveQueuedCount: count => _activePrompt?.UpdateQueuedCount(count),
             releaseSuspendedEvent: evt =>
             {
-                if (_orchestrator is not null && evt.HasAnySuspendedProcess)
+                if (_orchestrator is null || !evt.HasAnySuspendedProcess)
                 {
-                    try { _orchestrator.AllowAndResumeProcess(evt, addToWhitelist: false, grantSessionImmunity: false); } catch { }
+                    return true;
+                }
+                try
+                {
+                    var res = _orchestrator.AllowAndResumeProcessDetailed(evt, addToWhitelist: false, grantSessionImmunity: false);
+                    return res.AllCleared;
+                }
+                catch
+                {
+                    return false;
                 }
             });
         _mainWindow = new MainWindow(_orchestrator);
@@ -182,7 +191,7 @@ public partial class App : System.Windows.Application, IDisposable
         if (_orchestrator is null || _cleanedUp) return;
         // Keep Owner = null and ShowActivated = False so minimizing MainWindow never hides the alert
         // and the popup never steals keyboard focus mid-typing!
-        var prompt = new ThreatPromptWindow(_orchestrator, evt, _promptCoordinator?.QueuedCount ?? 0);
+        var prompt = new ThreatPromptWindow(_orchestrator, evt, _promptCoordinator?.PendingTotalCount ?? 0);
         _activePrompt = prompt;
         prompt.Closed += (_, _) =>
         {

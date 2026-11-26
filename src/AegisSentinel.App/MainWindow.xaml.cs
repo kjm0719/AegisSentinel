@@ -1224,10 +1224,19 @@ public partial class MainWindow : Window
         if (btn is not null) btn.IsEnabled = false;
         try
         {
-            await Task.Run(() => _orchestrator.KillAndQuarantine(row.Source));
+            var res = await Task.Run(() => _orchestrator.KillAndQuarantineDetailed(row.Source));
             EventsListView.Items.Refresh();
             DashboardRecentListView.Items.Refresh();
             RefreshQuarantineList();
+            if (res.HasAnyPendingFrozenProcess)
+            {
+                FooterMessageText.Text = row.Source.ContainmentDetail;
+                System.Windows.MessageBox.Show(
+                    $"일부 동결된 프로세스 종료에 실패해 추적이 유지되었습니다.\n{row.Source.ContainmentDetail}",
+                    "부분 종료 경고 (재시도 필요)",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
         }
         catch (Exception ex)
         {
@@ -1601,6 +1610,11 @@ public partial class MainWindow : Window
             }
             else
             {
+                if (res.Status == QuarantineRestoreStatus.RestoredButRebootDeleteCancelFailed)
+                {
+                    RefreshQuarantineList();
+                    FooterMessageText.Text = "복원 경고: 재부팅 삭제 예약 취소 실패 — 격리 사본 보존됨";
+                }
                 System.Windows.MessageBox.Show($"격리 파일 복원 실패: {res.Message}", "격리소 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }

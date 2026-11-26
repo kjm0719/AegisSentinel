@@ -260,19 +260,51 @@ public partial class ThreatPromptWindow : Window
 
     private async void OnKillAndQuarantineClick(object sender, RoutedEventArgs e)
     {
+        await HandleKillAndQuarantineAsync();
+    }
+
+    internal async System.Threading.Tasks.Task HandleKillAndQuarantineAsync()
+    {
         SetActionButtonsEnabled(false);
-        _decisionHandled = true;
-        bool ok = false;
+        KillAndQuarantineResult? result = null;
         try
         {
-            ok = await System.Threading.Tasks.Task.Run(() => _orchestrator.KillAndQuarantine(_event));
+            result = await System.Threading.Tasks.Task.Run(() => _orchestrator.KillAndQuarantineDetailed(_event));
         }
-        catch { }
-
-        if (!ok)
+        catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                this,
+            ShowPromptMessageBox(
+                $"종료 및 격리 처리 중 오류가 발생했습니다: {ex.Message}",
+                "AegisSentinel",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetActionButtonsEnabled(true);
+            return;
+        }
+
+        if (result.HasAnyPendingFrozenProcess)
+        {
+            RefreshSuspensionDisplay();
+            var pending = new List<int>();
+            if (result.RootStillSuspended) pending.Add(_event.ProcessId);
+            pending.AddRange(result.RemainingSuspendedChildPids);
+
+            ShowPromptMessageBox(
+                $"일부 동결된 프로세스의 종료에 실패해 추적 목록에 유지되었습니다.\n\n" +
+                $"남은 동결 PID: {string.Join(", ", pending.Distinct())}\n" +
+                $"상태: {_event.ContainmentDetail}\n\n" +
+                "[즉시 종료 및 격리]를 다시 시도하거나, [1회 허용]으로 남은 동결 프로세스를 재개할 수 있습니다.",
+                "부분 종료 경고 (동결 대상 남음)",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            SetActionButtonsEnabled(true);
+            return;
+        }
+
+        _decisionHandled = true;
+        if (!result.OverallSuccess)
+        {
+            ShowPromptMessageBox(
                 "종료 또는 롤백 대상이 이미 종료되었거나 관리자 권한이 필요합니다.",
                 "AegisSentinel",
                 MessageBoxButton.OK,

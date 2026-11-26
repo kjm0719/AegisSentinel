@@ -590,25 +590,42 @@ public sealed class SecurityOrchestrator : IDisposable
         return result;
     }
 
-    public bool KillAndQuarantine(SecurityEvent evt)
+    public bool KillAndQuarantine(SecurityEvent evt) =>
+        KillAndQuarantineDetailed(evt).OverallSuccess;
+
+    public KillAndQuarantineResult KillAndQuarantineDetailed(SecurityEvent evt)
     {
         bool hasTargetProcess = evt.ProcessId > 4;
         bool killed = false;
+        ProcessTerminationStatus? rootStatus = null;
+        bool rootStillSuspended = false;
         var detailParts = new List<string>();
         var handledChildPids = new HashSet<int>();
+        var childResults = new List<ProcessTerminationItemResult>();
+        var remainingFrozenChildren = new HashSet<int>();
 
-        // P1-1: Terminate frozen child instances FIRST using single-handle creation-time verification
-        // so recycled PIDs belonging to unrelated newer processes are NEVER terminated.
+        // P1-1 + P1-B: Terminate frozen child instances FIRST using single-handle creation-time verification,
+        // preserving tracking for any frozen child that fails to terminate so user can retry or resume.
         foreach (var childInst in evt.SuspendedChildInstances.ToList())
         {
             if (childInst.ProcessId <= 4 || childInst.ProcessId == evt.ProcessId) continue;
             handledChildPids.Add(childInst.ProcessId);
-            _activeInterventionPids.TryRemove(childInst.ProcessId, out _);
-            _riskEngine.ClearProcess(childInst.ProcessId);
-            _processController.TryTerminateProcessInstance(
+            var childRes = _processController.TryTerminateProcessInstanceDetailed(
                 childInst.ProcessId,
                 childInst.CreationTimeFileTimeUtc,
                 childInst.ExecutablePath);
+            childResults.Add(childRes);
+
+            if (childRes.StillSuspendedByUs || childRes.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
+            {
+                remainingFrozenChildren.Add(childInst.ProcessId);
+                _activeInterventionPids[childInst.ProcessId] = 1;
+            }
+            else
+            {
+                _activeInterventionPids.TryRemove(childInst.ProcessId, out _);
+                _riskEngine.ClearProcess(childInst.ProcessId);
+            }
         }
 
         // For any legacy SuspendedChildProcessIds without an explicit instance record,
@@ -619,24 +636,42 @@ public sealed class SecurityOrchestrator : IDisposable
             {
                 continue;
             }
-            _activeInterventionPids.TryRemove(suspendedChildPid, out _);
-            _riskEngine.ClearProcess(suspendedChildPid);
             if (_processController.TryGetTrackedSuspendedInstance(suspendedChildPid, out var trackedChild) &&
                 trackedChild is not null &&
                 (trackedChild.CreationTimeFileTimeUtc != 0 || !string.IsNullOrWhiteSpace(trackedChild.ExecutablePath)))
             {
-                _processController.TryTerminateProcessInstance(
+                var childRes = _processController.TryTerminateProcessInstanceDetailed(
                     trackedChild.ProcessId,
                     trackedChild.CreationTimeFileTimeUtc,
                     trackedChild.ExecutablePath);
+                childResults.Add(childRes);
+
+                if (childRes.StillSuspendedByUs || childRes.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
+                {
+                    remainingFrozenChildren.Add(suspendedChildPid);
+                    _activeInterventionPids[suspendedChildPid] = 1;
+                    continue;
+                }
             }
+            else if (_processController.IsProcessSuspendedByUs(suspendedChildPid))
+            {
+                // Still suspended by us without verifiable instance metadata -> do NOT silently drop tracking!
+                remainingFrozenChildren.Add(suspendedChildPid);
+                _activeInterventionPids[suspendedChildPid] = 1;
+                childResults.Add(new ProcessTerminationItemResult(
+                    suspendedChildPid,
+                    ProcessTerminationStatus.TransientFailureRetryRequired,
+                    StillSuspendedByUs: true,
+                    "인스턴스 식별 정보 부족으로 종료 보류 — 재개 또는 수동 확인 필요"));
+                continue;
+            }
+
+            _activeInterventionPids.TryRemove(suspendedChildPid, out _);
+            _riskEngine.ClearProcess(suspendedChildPid);
         }
 
         if (hasTargetProcess)
         {
-            _activeInterventionPids.TryRemove(evt.ProcessId, out _);
-            _riskEngine.ClearProcess(evt.ProcessId);
-
             // Verify root process identity before inspecting live descendants so a recycled root PID never kills innocent children.
             bool rootIdentityMatches = true;
             if (_processController.TryGetProcessInstanceIdentity(evt.ProcessId, out var liveRoot) && liveRoot is not null)
@@ -669,8 +704,6 @@ public sealed class SecurityOrchestrator : IDisposable
                     {
                         continue;
                     }
-                    _activeInterventionPids.TryRemove(descPid, out _);
-                    _riskEngine.ClearProcess(descPid);
 
                     if (_processController.TryGetProcessInstanceIdentity(descPid, out var descIdentity) && descIdentity is not null)
                     {
@@ -681,27 +714,75 @@ public sealed class SecurityOrchestrator : IDisposable
                         {
                             continue;
                         }
-                        _processController.TryTerminateProcessInstance(
+                        var descRes = _processController.TryTerminateProcessInstanceDetailed(
                             descPid,
                             descIdentity.CreationTimeFileTimeUtc,
                             descIdentity.ExecutablePath);
+                        childResults.Add(descRes);
+                        if (descRes.StillSuspendedByUs || descRes.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
+                        {
+                            remainingFrozenChildren.Add(descPid);
+                            _activeInterventionPids[descPid] = 1;
+                            continue;
+                        }
                     }
+
+                    _activeInterventionPids.TryRemove(descPid, out _);
+                    _riskEngine.ClearProcess(descPid);
                 }
 
-                killed = (evt.ProcessCreationTimeFileTimeUtc != 0 || !string.IsNullOrWhiteSpace(evt.ProcessPath))
-                    ? _processController.TryTerminateProcessInstance(
+                if (evt.ProcessCreationTimeFileTimeUtc != 0 || !string.IsNullOrWhiteSpace(evt.ProcessPath))
+                {
+                    var rootRes = _processController.TryTerminateProcessInstanceDetailed(
                         evt.ProcessId,
                         evt.ProcessCreationTimeFileTimeUtc,
-                        evt.ProcessPath)
-                    : _processController.TryTerminateProcess(evt.ProcessId);
+                        evt.ProcessPath);
+                    rootStatus = rootRes.Status;
+                    killed = rootRes.Status == ProcessTerminationStatus.Terminated;
+                    rootStillSuspended = rootRes.StillSuspendedByUs ||
+                                         (evt.IsProcessSuspended && rootRes.Status == ProcessTerminationStatus.TransientFailureRetryRequired);
+                }
+                else
+                {
+                    killed = _processController.TryTerminateProcess(evt.ProcessId);
+                    rootStatus = killed ? ProcessTerminationStatus.Terminated : ProcessTerminationStatus.AlreadyExitedOrReplaced;
+                    rootStillSuspended = !killed && _processController.IsProcessSuspendedByUs(evt.ProcessId);
+                }
+            }
+            else
+            {
+                rootStatus = ProcessTerminationStatus.AlreadyExitedOrReplaced;
+                rootStillSuspended = false;
+            }
+
+            if (!rootStillSuspended)
+            {
+                _activeInterventionPids.TryRemove(evt.ProcessId, out _);
+                _riskEngine.ClearProcess(evt.ProcessId);
+            }
+            else
+            {
+                _activeInterventionPids[evt.ProcessId] = 1;
             }
 
             evt.ProcessTerminationSucceeded = killed;
-            detailParts.Add(killed ? $"프로세스(PID {evt.ProcessId}) 종료 완료" : $"프로세스(PID {evt.ProcessId}) 종료 실패/미실행");
+            detailParts.Add(killed
+                ? $"프로세스(PID {evt.ProcessId}) 종료 완료"
+                : (rootStillSuspended
+                    ? $"프로세스(PID {evt.ProcessId}) 종료 실패(동결 유지 — 재시도 필요)"
+                    : $"프로세스(PID {evt.ProcessId}) 종료 실패/미실행"));
         }
-        evt.IsProcessSuspended = false;
-        evt.SuspendedChildProcessIds.Clear();
-        evt.SuspendedChildInstances.Clear();
+
+        evt.IsProcessSuspended = rootStillSuspended;
+        evt.SuspendedChildProcessIds = remainingFrozenChildren.OrderBy(p => p).ToList();
+        evt.SuspendedChildInstances = evt.SuspendedChildInstances
+            .Where(inst => remainingFrozenChildren.Contains(inst.ProcessId))
+            .ToList();
+
+        if (remainingFrozenChildren.Count > 0)
+        {
+            detailParts.Add($"자식 종료 실패(동결 유지 · 재시도/재개 필요) PID: [{string.Join(", ", remainingFrozenChildren.OrderBy(p => p))}]");
+        }
 
         // TargetPath is only the malicious file for static file / DLL / USB drops.
         // For behavioral process attacks (Ransomware, CredentialAccess, SupplyChain, etc.),
@@ -786,21 +867,39 @@ public sealed class SecurityOrchestrator : IDisposable
             evt.ContainmentDetail = string.Join(" | ", detailParts);
         }
 
+        bool hasPendingFrozen = rootStillSuspended || remainingFrozenChildren.Count > 0;
+        bool overallSuccess;
         if (quarantineRemovedOrScheduled || rolledBack)
         {
-            return true;
+            overallSuccess = !hasPendingFrozen;
         }
-
-        if (hasTargetProcess && killed)
+        else if (hasTargetProcess && killed)
         {
             evt.ActionTaken = SecurityActionTaken.Terminated;
-            return true;
+            overallSuccess = !hasPendingFrozen;
+        }
+        else
+        {
+            evt.ActionTaken = qDisposition == QuarantineDisposition.CopyOnlyOriginalLocked
+                ? SecurityActionTaken.QuarantineCopyOnly
+                : (hasPendingFrozen ? SecurityActionTaken.Suspended : SecurityActionTaken.Logged);
+            overallSuccess = false;
         }
 
-        evt.ActionTaken = qDisposition == QuarantineDisposition.CopyOnlyOriginalLocked
-            ? SecurityActionTaken.QuarantineCopyOnly
-            : SecurityActionTaken.Logged;
-        return false;
+        if (hasPendingFrozen)
+        {
+            _auditLog.Append(evt);
+        }
+
+        return new KillAndQuarantineResult(
+            RootTerminated: killed,
+            RootStatus: rootStatus,
+            RootStillSuspended: rootStillSuspended,
+            ChildResults: childResults,
+            QuarantineRemovedOrScheduled: quarantineRemovedOrScheduled,
+            QuarantineDisposition: qDisposition,
+            RolledBack: rolledBack,
+            OverallSuccess: overallSuccess);
     }
 
     private void SweepSuspiciousProcessMemory()

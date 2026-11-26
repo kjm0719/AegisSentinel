@@ -5,25 +5,28 @@ namespace AegisSentinel.Core.Engine;
 /// <summary>
 /// Manages single-active-prompt + FIFO queueing for security intervention dialogs.
 /// Guarantees that child-only suspended events are never stranded on queue saturation,
-/// duplicate suppression, or shutdown, and merging duplicates never prematurely resumes
-/// processes still managed by an active/queued prompt.
+/// duplicate suppression, auto-resume failure, or shutdown, and merging duplicates never
+/// prematurely resumes processes still managed by an active/queued prompt.
 /// </summary>
 public sealed class ThreatPromptQueueCoordinator
 {
     private readonly int _maxQueuedPrompts;
     private readonly Action<SecurityEvent> _showPrompt;
     private readonly Action<int> _updateActiveQueuedCount;
-    private readonly Action<SecurityEvent> _releaseSuspendedEvent;
+    private readonly Func<SecurityEvent, bool> _releaseSuspendedEvent;
     private readonly Queue<SecurityEvent> _queue = new();
+    private readonly List<SecurityEvent> _unresolvedRetryEvents = new();
 
     public SecurityEvent? ActiveEvent { get; private set; }
     public int QueuedCount => _queue.Count;
+    public IReadOnlyList<SecurityEvent> UnresolvedRetryEvents => _unresolvedRetryEvents.AsReadOnly();
+    public int PendingTotalCount => _queue.Count + _unresolvedRetryEvents.Count;
 
     public ThreatPromptQueueCoordinator(
         int maxQueuedPrompts,
         Action<SecurityEvent> showPrompt,
         Action<int> updateActiveQueuedCount,
-        Action<SecurityEvent> releaseSuspendedEvent)
+        Func<SecurityEvent, bool> releaseSuspendedEvent)
     {
         _maxQueuedPrompts = Math.Max(0, maxQueuedPrompts);
         _showPrompt = showPrompt;
@@ -31,9 +34,26 @@ public sealed class ThreatPromptQueueCoordinator
         _releaseSuspendedEvent = releaseSuspendedEvent;
     }
 
+    public ThreatPromptQueueCoordinator(
+        int maxQueuedPrompts,
+        Action<SecurityEvent> showPrompt,
+        Action<int> updateActiveQueuedCount,
+        Action<SecurityEvent> releaseSuspendedEvent)
+        : this(
+            maxQueuedPrompts,
+            showPrompt,
+            updateActiveQueuedCount,
+            evt =>
+            {
+                releaseSuspendedEvent(evt);
+                return !evt.HasAnySuspendedProcess;
+            })
+    {
+    }
+
     public void EnqueueOrShow(SecurityEvent incoming)
     {
-        // 1. Check exact duplicate prompt in active or queued items
+        // 1. Check exact duplicate prompt in active, queued, or unresolved-retry items
         var duplicate = FindMatchingPrompt(e => IsSamePrompt(e, incoming));
         if (duplicate is not null)
         {
@@ -65,16 +85,68 @@ public sealed class ThreatPromptQueueCoordinator
                 }
             }
 
-            // Otherwise, release ANY suspended root OR child processes so nothing is stranded frozen!
+            // Otherwise, attempt to release ANY suspended root OR child processes.
+            // If release fails (or frozen targets remain), retain in _unresolvedRetryEvents
+            // so the user receives a prioritized retry/intervention prompt instead of silently dropping it!
             if (incoming.HasAnySuspendedProcess)
             {
-                _releaseSuspendedEvent(incoming);
+                bool cleared = false;
+                try { cleared = _releaseSuspendedEvent(incoming); } catch { cleared = false; }
+                if (!cleared || incoming.HasAnySuspendedProcess)
+                {
+                    var existingUnresolved = incoming.ProcessId > 4
+                        ? _unresolvedRetryEvents.FirstOrDefault(e => e.ProcessId == incoming.ProcessId)
+                        : null;
+                    if (existingUnresolved is not null)
+                    {
+                        MergeSuspendedTargetsInto(existingUnresolved, incoming);
+                    }
+                    else
+                    {
+                        _unresolvedRetryEvents.Add(incoming);
+                    }
+                    _updateActiveQueuedCount(PendingTotalCount);
+                }
             }
             return;
         }
 
         _queue.Enqueue(incoming);
-        _updateActiveQueuedCount(_queue.Count);
+        _updateActiveQueuedCount(PendingTotalCount);
+    }
+
+    /// <summary>
+    /// Retries releasing any previously failed saturated-queue suspended events,
+    /// returning the number of events that were successfully cleared.
+    /// </summary>
+    public int RetryUnresolvedReleases()
+    {
+        int clearedCount = 0;
+        for (int i = _unresolvedRetryEvents.Count - 1; i >= 0; i--)
+        {
+            var evt = _unresolvedRetryEvents[i];
+            if (!evt.HasAnySuspendedProcess)
+            {
+                _unresolvedRetryEvents.RemoveAt(i);
+                clearedCount++;
+                continue;
+            }
+
+            bool cleared = false;
+            try { cleared = _releaseSuspendedEvent(evt); } catch { cleared = false; }
+            if (cleared && !evt.HasAnySuspendedProcess)
+            {
+                _unresolvedRetryEvents.RemoveAt(i);
+                clearedCount++;
+            }
+        }
+
+        if (ActiveEvent is not null)
+        {
+            _updateActiveQueuedCount(PendingTotalCount);
+        }
+
+        return clearedCount;
     }
 
     public void OnActivePromptClosed(SecurityEvent closedEvent)
@@ -84,7 +156,26 @@ public sealed class ThreatPromptQueueCoordinator
             ActiveEvent = null;
         }
 
-        if (ActiveEvent is null && _queue.Count > 0)
+        if (ActiveEvent is not null)
+        {
+            return;
+        }
+
+        // Prioritize unresolved failed-release frozen events first so the user always gets a retry/kill window!
+        while (_unresolvedRetryEvents.Count > 0)
+        {
+            var unresolved = _unresolvedRetryEvents[0];
+            _unresolvedRetryEvents.RemoveAt(0);
+            if (!unresolved.HasAnySuspendedProcess)
+            {
+                continue;
+            }
+            ActiveEvent = unresolved;
+            _showPrompt(unresolved);
+            return;
+        }
+
+        if (_queue.Count > 0)
         {
             var next = _queue.Dequeue();
             ActiveEvent = next;
@@ -102,6 +193,16 @@ public sealed class ThreatPromptQueueCoordinator
                 try { _releaseSuspendedEvent(pending); } catch { }
             }
         }
+
+        while (_unresolvedRetryEvents.Count > 0)
+        {
+            var unresolved = _unresolvedRetryEvents[0];
+            _unresolvedRetryEvents.RemoveAt(0);
+            if (unresolved.HasAnySuspendedProcess)
+            {
+                try { _releaseSuspendedEvent(unresolved); } catch { }
+            }
+        }
     }
 
     public void ClearActiveWithoutClosing()
@@ -114,6 +215,14 @@ public sealed class ThreatPromptQueueCoordinator
         if (ActiveEvent is not null && predicate(ActiveEvent))
         {
             return ActiveEvent;
+        }
+
+        foreach (var unresolved in _unresolvedRetryEvents)
+        {
+            if (predicate(unresolved))
+            {
+                return unresolved;
+            }
         }
 
         foreach (var queued in _queue)

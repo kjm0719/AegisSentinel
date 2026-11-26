@@ -25,6 +25,8 @@ public sealed class QuarantineManager
     private readonly object _keySync = new();
     private readonly Func<string, bool>? _deleteFileOverride;
     private readonly Func<string, bool>? _scheduleRebootDeleteOverride;
+    private readonly Func<string, bool>? _cancelRebootDeleteOverride;
+    private readonly Func<string, bool>? _isRebootDeleteScheduledOverride;
     private readonly Action<string, string>? _writeMetadataOverride;
     private readonly Action<string, byte[]>? _writeRestoreTempOverride;
     private readonly long _maxInMemoryGcmBytes;
@@ -38,7 +40,9 @@ public sealed class QuarantineManager
         Func<string, bool>? scheduleRebootDeleteOverride = null,
         Action<string, string>? writeMetadataOverride = null,
         Action<string, byte[]>? writeRestoreTempOverride = null,
-        long maxInMemoryGcmBytes = MaxInMemoryGcmBytes)
+        long maxInMemoryGcmBytes = MaxInMemoryGcmBytes,
+        Func<string, bool>? cancelRebootDeleteOverride = null,
+        Func<string, bool>? isRebootDeleteScheduledOverride = null)
     {
         var root = baseDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -48,6 +52,8 @@ public sealed class QuarantineManager
         _keyFilePath = Path.Combine(QuarantineDirectory, ".quarantine_aes.key");
         _deleteFileOverride = deleteFileOverride;
         _scheduleRebootDeleteOverride = scheduleRebootDeleteOverride;
+        _cancelRebootDeleteOverride = cancelRebootDeleteOverride;
+        _isRebootDeleteScheduledOverride = isRebootDeleteScheduledOverride;
         _writeMetadataOverride = writeMetadataOverride;
         _writeRestoreTempOverride = writeRestoreTempOverride;
         _maxInMemoryGcmBytes = Math.Max(0, maxInMemoryGcmBytes);
@@ -572,7 +578,21 @@ public sealed class QuarantineManager
                 try { if (File.Exists(tmpDest)) File.Delete(tmpDest); } catch { }
             }
 
-            TryCancelPendingRebootDelete(destination);
+            bool hasPendingRebootDelete =
+                entry.Disposition == QuarantineDisposition.ScheduledDeleteOnReboot ||
+                !TryCheckPendingRebootDeleteScheduled(destination, out bool scheduledInRegistry) ||
+                scheduledInRegistry;
+
+            bool rebootDeleteCancelConfirmed = TryCancelPendingRebootDelete(destination, requireConfirmedRemoval: hasPendingRebootDelete);
+            if (!rebootDeleteCancelConfirmed)
+            {
+                // Preserve quarantine copy + metadata so next reboot's pending OS delete cannot cause permanent data loss!
+                return new QuarantineRestoreResult(
+                    QuarantineRestoreStatus.RestoredButRebootDeleteCancelFailed,
+                    destination,
+                    $"파일은 복원되었으나 재부팅 시 OS 자동 삭제 예약 취소에 실패했습니다. 다음 부팅 시 복원된 파일이 삭제될 수 있으므로 격리 사본을 보존했습니다: {destination}");
+            }
+
             DeletePermanently(entryId);
             return new QuarantineRestoreResult(QuarantineRestoreStatus.Restored, destination, $"복원 완료: {destination}");
         }
@@ -599,14 +619,32 @@ public sealed class QuarantineManager
         output.Flush(flushToDisk: true);
     }
 
-    private static bool IsPendingRebootDeleteScheduled(string filePath)
+    private bool IsPendingRebootDeleteScheduled(string filePath) =>
+        TryCheckPendingRebootDeleteScheduled(filePath, out bool isScheduled) && isScheduled;
+
+    private bool TryCheckPendingRebootDeleteScheduled(string filePath, out bool isScheduled)
     {
+        if (_isRebootDeleteScheduledOverride is not null)
+        {
+            isScheduled = _isRebootDeleteScheduledOverride(filePath);
+            return true;
+        }
+
         try
         {
             var full = Path.GetFullPath(filePath);
             using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
                 @"SYSTEM\CurrentControlSet\Control\Session Manager", writable: false);
-            if (key?.GetValue("PendingFileRenameOperations") is not string[] ops || ops.Length < 1) return false;
+            if (key is null)
+            {
+                isScheduled = false;
+                return false;
+            }
+            if (key.GetValue("PendingFileRenameOperations") is not string[] ops || ops.Length < 1)
+            {
+                isScheduled = false;
+                return true;
+            }
 
             var targetNt = @"\??\" + full;
             for (int i = 0; i < ops.Length; i += 2)
@@ -615,24 +653,50 @@ public sealed class QuarantineManager
                 var dst = i + 1 < ops.Length ? ops[i + 1] : string.Empty;
                 if (string.IsNullOrEmpty(dst) && src.Equals(targetNt, StringComparison.OrdinalIgnoreCase))
                 {
+                    isScheduled = true;
                     return true;
                 }
             }
+            isScheduled = false;
+            return true;
         }
-        catch { }
-        return false;
+        catch
+        {
+            isScheduled = false;
+            return false;
+        }
     }
 
-    private static void TryCancelPendingRebootDelete(string filePath)
+    private bool TryCancelPendingRebootDelete(string filePath, bool requireConfirmedRemoval)
     {
+        if (_cancelRebootDeleteOverride is not null)
+        {
+            return _cancelRebootDeleteOverride(filePath);
+        }
+
+        bool checkSucceeded = TryCheckPendingRebootDeleteScheduled(filePath, out bool currentlyScheduled);
+        if (checkSucceeded && !currentlyScheduled)
+        {
+            // Confirmed not scheduled in PendingFileRenameOperations — no HKLM write required.
+            return true;
+        }
+
         try
         {
             var full = Path.GetFullPath(filePath);
             using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
                 @"SYSTEM\CurrentControlSet\Control\Session Manager", writable: true);
+            if (key is null)
+            {
+                return !requireConfirmedRemoval && checkSucceeded && !currentlyScheduled;
+            }
+
             // Note: When a single delete-on-reboot entry ("\??\C:\file\0\0\0") exists, .NET RegistryKey.GetValue
             // stops at the double-null and returns a 1-element string[] — so accept ops.Length >= 1!
-            if (key?.GetValue("PendingFileRenameOperations") is not string[] ops || ops.Length < 1) return;
+            if (key.GetValue("PendingFileRenameOperations") is not string[] ops || ops.Length < 1)
+            {
+                return true;
+            }
 
             var targetNt = @"\??\" + full;
             var filtered = new List<string>(ops.Length + 1);
@@ -655,8 +719,14 @@ public sealed class QuarantineManager
                 if (filtered.Count == 0) key.DeleteValue("PendingFileRenameOperations", throwOnMissingValue: false);
                 else key.SetValue("PendingFileRenameOperations", filtered.ToArray(), Microsoft.Win32.RegistryValueKind.MultiString);
             }
+
+            // Confirm via re-read that the pending reboot delete entry is genuinely gone.
+            return TryCheckPendingRebootDeleteScheduled(filePath, out bool stillScheduled) && !stillScheduled;
         }
-        catch { }
+        catch
+        {
+            return false;
+        }
     }
 
     public bool DeletePermanently(string entryId)

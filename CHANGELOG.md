@@ -9,6 +9,19 @@
 
 ---
 
+## [1.1.1] - 2026-11-26
+
+### 수정 (Fixed)
+- **재부팅 삭제 예약 취소 실패 시 격리 사본 보존 (`QuarantineManager`)**: `TryCancelPendingRebootDelete()`가 레지스트리 변경 및 재조회 확인 결과를 `bool`로 반환하도록 변경. 취소 확인 실패 시 `QuarantineRestoreStatus.RestoredButRebootDeleteCancelFailed`를 반환하고 격리 사본(`.aegisq`·`.json`)을 삭제하지 않고 보존.
+- **‘종료 및 격리’ 자식 종료 실패 추적 유지 및 경고창 재시도 (`SecurityOrchestrator` · `ThreatPromptWindow` · `MainWindow`)**: `TryTerminateProcessInstanceDetailed()`·`KillAndQuarantineDetailed()`가 프로세스별 종료 결과를 반환하고, 종료에 실패한 동결 자식/부모는 추적 목록에 유지하며 경고창을 닫지 않고 재시도 또는 재개할 수 있도록 수정.
+- **프로세스 생성 시각 조회 실패 3분류 (`ProcessController`)**: `VerifyHandleCreationTime()`이 `Matched` / `Mismatched` / `LookupFailed`를 명확히 구분해 조회 실패 시 재개(`ResumeProcess`)·종료(`TerminateProcess`)와 `_suspendedPids` 추적 삭제를 모두 보류(`TransientFailureRetryRequired`).
+- **경고 대기열 포화 시 자동 재개 실패 사건 인계 (`ThreatPromptQueueCoordinator` · `App.xaml.cs`)**: 해제 콜백이 완료 여부(`bool`)를 반환하도록 변경하고, 실패한 사건은 `_unresolvedRetryEvents`에 보존해 활성 경고 종료 시 최우선으로 사용자에게 표시 및 `RetryUnresolvedReleases()` 재시도를 지원.
+
+### 테스트 (Tests)
+- `ContainmentFailurePathRegressionTests` 4종 추가 (재부팅 삭제 예약 취소 실패, 자식 종료 실패 + WPF 경고창 유지, 생성 시각 조회 실패 후 재시도, 대기열 포화 자식 재개 실패 인계 — 전체 **53 / 53 통과**).
+
+---
+
 ## [1.1.0] - 2026-11-26
 
 ### 추가 (Added)
@@ -46,7 +59,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/kjm0719/AegisSentinel/releases/tag/v1.0.0

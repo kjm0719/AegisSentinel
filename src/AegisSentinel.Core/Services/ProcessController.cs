@@ -420,6 +420,30 @@ public sealed class ProcessController
 
     public bool TrySuspendProcess(int pid) => TrySuspendProcessDetailed(pid, out _);
 
+    private enum InstanceIdentityMatch
+    {
+        Matched,
+        Mismatched,
+        LookupFailed
+    }
+
+    private InstanceIdentityMatch VerifyHandleCreationTime(IntPtr handle, long expectedCreationTimeUtc)
+    {
+        if (expectedCreationTimeUtc == 0)
+        {
+            return InstanceIdentityMatch.Matched;
+        }
+
+        if (!_nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long liveCreationTime) || liveCreationTime == 0)
+        {
+            return InstanceIdentityMatch.LookupFailed;
+        }
+
+        return liveCreationTime == expectedCreationTimeUtc
+            ? InstanceIdentityMatch.Matched
+            : InstanceIdentityMatch.Mismatched;
+    }
+
     public ProcessResumeItemResult TryResumeProcessDetailed(int pid, long expectedCreationTimeUtc = 0)
     {
         if (!_suspendedPids.TryGetValue(pid, out var tracked))
@@ -465,14 +489,19 @@ public sealed class ProcessController
                 return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "프로세스가 이미 종료됨");
             }
 
-            if (targetCreationTime != 0 &&
-                _nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long liveCreationTime) &&
-                liveCreationTime != 0 &&
-                liveCreationTime != targetCreationTime)
+            switch (VerifyHandleCreationTime(handle, targetCreationTime))
             {
-                // PID was recycled to a different process instance — do not resume it, and clear stale tracking.
-                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
-                return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "PID가 다른 프로세스로 교체됨");
+                case InstanceIdentityMatch.Mismatched:
+                    // PID was recycled to a different process instance — do not resume it, and clear stale tracking.
+                    _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                    return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "PID가 다른 프로세스로 교체됨");
+
+                case InstanceIdentityMatch.LookupFailed:
+                    // Could not read creation time — hold BOTH ResumeProcess and tracking removal until retry confirms identity!
+                    return new ProcessResumeItemResult(
+                        pid,
+                        ProcessResumeStatus.TransientFailureRetryRequired,
+                        "프로세스 생성 시각 조회 실패 — 신원 확인 불가로 재개 보류 (재시도 필요)");
             }
 
             int ntStatus = _nativeOps.ResumeProcess(handle);
@@ -506,13 +535,20 @@ public sealed class ProcessController
     /// <summary>
     /// Terminates a specific process instance using ONE handle for both identity verification
     /// (creation time + executable path + critical-process check) and TerminateProcess,
-    /// completely eliminating PID-reuse TOCTOU windows.
+    /// returning structured status so lookup/termination failures never drop frozen-process tracking.
     /// </summary>
-    public bool TryTerminateProcessInstance(int pid, long expectedCreationTimeUtc, string? expectedExecutablePath = null)
+    public ProcessTerminationItemResult TryTerminateProcessInstanceDetailed(
+        int pid,
+        long expectedCreationTimeUtc,
+        string? expectedExecutablePath = null)
     {
         if (pid <= 4 || pid == Environment.ProcessId || InternalHelperProcessRegistry.IsInternalHelper(pid))
         {
-            return false;
+            return new ProcessTerminationItemResult(
+                pid,
+                ProcessTerminationStatus.ProtectedProcessSkipped,
+                IsProcessSuspendedByUs(pid),
+                "시스템/자체 보호 프로세스");
         }
 
         var handle = _nativeOps.OpenProcess(
@@ -521,13 +557,22 @@ public sealed class ProcessController
             out int openError);
         if (handle == IntPtr.Zero)
         {
-            if (openError == NativeMethods.ERROR_INVALID_PARAMETER &&
-                _suspendedPids.TryGetValue(pid, out var stale) &&
-                (expectedCreationTimeUtc == 0 || stale.CreationTimeFileTimeUtc == expectedCreationTimeUtc))
+            if (openError == NativeMethods.ERROR_INVALID_PARAMETER)
             {
-                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, stale));
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return new ProcessTerminationItemResult(
+                    pid,
+                    ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                    StillSuspendedByUs: false,
+                    "프로세스가 이미 종료됨");
             }
-            return false;
+
+            // Keep tracking entry intact so user/orchestrator can retry terminate or resume later!
+            return new ProcessTerminationItemResult(
+                pid,
+                ProcessTerminationStatus.TransientFailureRetryRequired,
+                IsProcessSuspendedByUs(pid),
+                $"종료 핸들 열기 실패(Win32={openError}) — 재시도 필요");
         }
 
         try
@@ -535,31 +580,61 @@ public sealed class ProcessController
             if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
             {
                 RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
-                return false;
+                return new ProcessTerminationItemResult(
+                    pid,
+                    ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                    StillSuspendedByUs: false,
+                    "프로세스가 이미 종료됨");
             }
 
             var livePath = _nativeOps.QueryExecutablePath(handle);
             if (IsCriticalProtectedPath(livePath))
             {
-                return false;
+                return new ProcessTerminationItemResult(
+                    pid,
+                    ProcessTerminationStatus.ProtectedProcessSkipped,
+                    IsProcessSuspendedByUs(pid),
+                    "보호된 Windows/보안 프로세스");
             }
 
-            if (expectedCreationTimeUtc != 0)
+            switch (VerifyHandleCreationTime(handle, expectedCreationTimeUtc))
             {
-                if (!_nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long liveCreationTime) ||
-                    liveCreationTime != expectedCreationTimeUtc)
-                {
-                    // PID has been recycled to a different process instance — refuse to terminate!
+                case InstanceIdentityMatch.Mismatched:
+                    // PID has been recycled to a different process instance — refuse to terminate and clear stale tracking.
                     RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
-                    return false;
-                }
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                        StillSuspendedByUs: false,
+                        "PID가 다른 프로세스로 교체됨");
+
+                case InstanceIdentityMatch.LookupFailed:
+                    // Could not read creation time — hold BOTH TerminateProcess and tracking removal until retry confirms identity!
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.TransientFailureRetryRequired,
+                        IsProcessSuspendedByUs(pid),
+                        "프로세스 생성 시각 조회 실패 — 신원 확인 불가로 종료 보류 (재시도 필요)");
             }
-            else if (!string.IsNullOrWhiteSpace(expectedExecutablePath))
+
+            if (expectedCreationTimeUtc == 0 && !string.IsNullOrWhiteSpace(expectedExecutablePath))
             {
-                if (string.IsNullOrWhiteSpace(livePath) ||
-                    !livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                if (string.IsNullOrWhiteSpace(livePath))
                 {
-                    return false;
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.TransientFailureRetryRequired,
+                        IsProcessSuspendedByUs(pid),
+                        "실행 경로 조회 실패 — 신원 확인 불가로 종료 보류 (재시도 필요)");
+                }
+                if (!livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                        StillSuspendedByUs: false,
+                        "PID 실행 경로가 변경됨");
                 }
             }
 
@@ -568,21 +643,40 @@ public sealed class ProcessController
                 !string.IsNullOrWhiteSpace(livePath) &&
                 !livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return new ProcessTerminationItemResult(
+                    pid,
+                    ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                    StillSuspendedByUs: false,
+                    "PID 실행 경로가 불일치함");
             }
 
             bool terminated = _nativeOps.TerminateProcess(handle, 1);
             if (terminated)
             {
                 RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return new ProcessTerminationItemResult(
+                    pid,
+                    ProcessTerminationStatus.Terminated,
+                    StillSuspendedByUs: false,
+                    "정상 종료 완료");
             }
-            return terminated;
+
+            // TerminateProcess failed: keep tracking entry intact if still suspended!
+            return new ProcessTerminationItemResult(
+                pid,
+                ProcessTerminationStatus.TransientFailureRetryRequired,
+                IsProcessSuspendedByUs(pid),
+                "TerminateProcess 호출 실패 — 재시도 필요");
         }
         finally
         {
             _nativeOps.CloseHandle(handle);
         }
     }
+
+    public bool TryTerminateProcessInstance(int pid, long expectedCreationTimeUtc, string? expectedExecutablePath = null) =>
+        TryTerminateProcessInstanceDetailed(pid, expectedCreationTimeUtc, expectedExecutablePath).Status == ProcessTerminationStatus.Terminated;
 
     private void RemoveTrackedIfMatching(int pid, long expectedCreationTimeUtc)
     {
