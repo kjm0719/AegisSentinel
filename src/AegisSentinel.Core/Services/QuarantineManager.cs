@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -7,8 +8,13 @@ namespace AegisSentinel.Core.Services;
 
 public sealed class QuarantineManager
 {
+    public const string FormatAesGcmSingleShot = "AES-256-GCM";
+    public const string FormatAesGcmChunked = "AES-256-GCM-Chunked";
+    public const string FormatLegacyXor = "Legacy-XOR-AEGISQ1";
+
     private static readonly byte[] LegacyMagicHeader = Encoding.ASCII.GetBytes("AEGISQ1\0");
     private static readonly byte[] AesGcmMagicHeader = Encoding.ASCII.GetBytes("AEGISQ2\0");
+    private static readonly byte[] ChunkedAesGcmMagicHeader = Encoding.ASCII.GetBytes("AEGISQ3\0");
     private static readonly byte[] LegacyObfuscationKey =
     {
         0x5A, 0xA3, 0x19, 0xE7, 0x4C, 0x81, 0xD2, 0x3F,
@@ -17,7 +23,11 @@ public sealed class QuarantineManager
     private static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("AegisSentinel-Quarantine-AES256GCM-v7");
     private const int GcmNonceSize = 12;
     private const int GcmTagSize = 16;
-    private const long MaxInMemoryGcmBytes = 64 * 1024 * 1024; // 64 MB AES-GCM authenticated ceiling
+    private const long MaxInMemoryGcmBytes = 64 * 1024 * 1024; // 64 MB single-shot AES-GCM ceiling
+    private const int DefaultChunkedGcmChunkSize = 1024 * 1024; // 1 MB authenticated chunks for AEGISQ3
+    private const int MaxChunkedGcmChunkSize = 16 * 1024 * 1024; // 16 MB upper bound on restore allocation
+    private const byte ChunkFlagIntermediate = 0x00;
+    private const byte ChunkFlagFinal = 0x01;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -29,7 +39,9 @@ public sealed class QuarantineManager
     private readonly Func<string, bool>? _isRebootDeleteScheduledOverride;
     private readonly Action<string, string>? _writeMetadataOverride;
     private readonly Action<string, byte[]>? _writeRestoreTempOverride;
+    private readonly Action? _onAfterFirstReadChunkForTest;
     private readonly long _maxInMemoryGcmBytes;
+    private readonly int _chunkedGcmChunkSize;
     private byte[]? _cachedAesKey;
 
     public string QuarantineDirectory { get; }
@@ -42,7 +54,9 @@ public sealed class QuarantineManager
         Action<string, byte[]>? writeRestoreTempOverride = null,
         long maxInMemoryGcmBytes = MaxInMemoryGcmBytes,
         Func<string, bool>? cancelRebootDeleteOverride = null,
-        Func<string, bool>? isRebootDeleteScheduledOverride = null)
+        Func<string, bool>? isRebootDeleteScheduledOverride = null,
+        int chunkedGcmChunkSize = DefaultChunkedGcmChunkSize,
+        Action? onAfterFirstReadChunkForTest = null)
     {
         var root = baseDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -56,7 +70,9 @@ public sealed class QuarantineManager
         _isRebootDeleteScheduledOverride = isRebootDeleteScheduledOverride;
         _writeMetadataOverride = writeMetadataOverride;
         _writeRestoreTempOverride = writeRestoreTempOverride;
-        _maxInMemoryGcmBytes = Math.Max(0, maxInMemoryGcmBytes);
+        _onAfterFirstReadChunkForTest = onAfterFirstReadChunkForTest;
+        _maxInMemoryGcmBytes = Math.Clamp(maxInMemoryGcmBytes, 0, MaxInMemoryGcmBytes);
+        _chunkedGcmChunkSize = Math.Clamp(chunkedGcmChunkSize, 1024, MaxChunkedGcmChunkSize);
     }
 
     private byte[] GetOrCreateAesKey()
@@ -123,70 +139,89 @@ public sealed class QuarantineManager
         var qFilePath = Path.Combine(QuarantineDirectory, $"{id}.aegisq");
         var metaPath = Path.Combine(QuarantineDirectory, $"{id}.json");
 
-        var fileSize = new FileInfo(originalPath).Length;
+        long initialSize = new FileInfo(originalPath).Length;
+        long effectiveInMemoryLimit = Math.Min(_maxInMemoryGcmBytes, MaxInMemoryGcmBytes);
+        long fileSize;
         string sha256;
+        string encryptionFormat;
 
         try
         {
-            if (fileSize <= _maxInMemoryGcmBytes)
+            using (var input = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
-                // Single-pass TOCTOU-free read + SHA-256 + AES-256-GCM AEAD encryption
-                byte[] plain;
-                using (var input = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                if (initialSize <= effectiveInMemoryLimit && effectiveInMemoryLimit > 0)
                 {
-                    using var ms = new MemoryStream((int)Math.Min(fileSize, _maxInMemoryGcmBytes));
-                    input.CopyTo(ms);
-                    plain = ms.ToArray();
-                }
+                    // Single-pass bounded read: if another process appends to the file mid-read so it crosses
+                    // effectiveInMemoryLimit, immediately spill into AEGISQ3 chunked AES-256-GCM so we NEVER
+                    // emit an oversized AEGISQ2 ciphertext that RestoreFileDetailed would reject!
+                    using var ms = new MemoryStream((int)Math.Min(Math.Max(initialSize, 0), Math.Min(effectiveInMemoryLimit, 4 * 1024 * 1024)));
+                    var readBuf = new byte[(int)Math.Min(65536, Math.Max(1024, effectiveInMemoryLimit))];
+                    bool exceededLimit = false;
+                    bool hookFired = false;
 
-                try
-                {
-                    fileSize = plain.Length;
-                    sha256 = Convert.ToHexString(SHA256.HashData(plain));
-                    var key = GetOrCreateAesKey();
-                    var nonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
-                    var cipher = new byte[plain.Length];
-                    var tag = new byte[GcmTagSize];
-                    using (var aes = new AesGcm(key, GcmTagSize))
+                    while (true)
                     {
-                        aes.Encrypt(nonce, plain, cipher, tag, AesGcmMagicHeader);
+                        long remainingPlusOne = (effectiveInMemoryLimit - ms.Length) + 1;
+                        int toRead = (int)Math.Min(readBuf.Length, remainingPlusOne);
+                        if (toRead <= 0)
+                        {
+                            exceededLimit = true;
+                            break;
+                        }
+
+                        int n = input.Read(readBuf, 0, toRead);
+                        if (n <= 0) break;
+                        ms.Write(readBuf, 0, n);
+
+                        if (!hookFired && _onAfterFirstReadChunkForTest is not null)
+                        {
+                            hookFired = true;
+                            _onAfterFirstReadChunkForTest();
+                        }
+
+                        if (ms.Length > effectiveInMemoryLimit)
+                        {
+                            exceededLimit = true;
+                            break;
+                        }
                     }
 
-                    using var output = new FileStream(qFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                    output.Write(AesGcmMagicHeader, 0, AesGcmMagicHeader.Length);
-                    output.Write(nonce, 0, nonce.Length);
-                    output.Write(tag, 0, tag.Length);
-                    output.Write(cipher, 0, cipher.Length);
-                    output.Flush(flushToDisk: true);
+                    if (!exceededLimit)
+                    {
+                        var plain = ms.ToArray();
+                        try
+                        {
+                            fileSize = plain.Length;
+                            sha256 = Convert.ToHexString(SHA256.HashData(plain));
+                            WriteSingleShotAesGcm(qFilePath, plain);
+                            encryptionFormat = FormatAesGcmSingleShot;
+                        }
+                        finally
+                        {
+                            CryptographicOperations.ZeroMemory(plain);
+                        }
+                    }
+                    else
+                    {
+                        ms.Position = 0;
+                        (fileSize, sha256) = WriteChunkedAesGcm(qFilePath, prefixStream: ms, tailStream: input);
+                        encryptionFormat = FormatAesGcmChunked;
+                    }
                 }
-                finally
+                else
                 {
-                    CryptographicOperations.ZeroMemory(plain);
+                    // Large files (>64 MiB or configured ceiling) use streaming chunked AES-256-GCM AEAD (AEGISQ3)
+                    // with O(1) memory instead of weak repeating XOR!
+                    (fileSize, sha256) = WriteChunkedAesGcm(qFilePath, prefixStream: null, tailStream: input);
+                    encryptionFormat = FormatAesGcmChunked;
                 }
             }
-            else
+
+            // Pre-delete restorability verification: ensure the written quarantine artifact adheres to a
+            // valid, restorable format before committing metadata or touching the original file.
+            if (!IsQuarantineArtifactRestorable(qFilePath, effectiveInMemoryLimit))
             {
-                // Streaming single-pass fallback for unusually large (>64 MB) quarantined archives
-                using var incHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                using var input = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                using var output = new FileStream(qFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                output.Write(LegacyMagicHeader, 0, LegacyMagicHeader.Length);
-                var buffer = new byte[65536];
-                int bytesRead;
-                long offset = 0;
-                while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    incHash.AppendData(buffer, 0, bytesRead);
-                    for (int i = 0; i < bytesRead; i++)
-                    {
-                        buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
-                    }
-                    output.Write(buffer, 0, bytesRead);
-                    offset += bytesRead;
-                }
-                output.Flush(flushToDisk: true);
-                fileSize = offset;
-                sha256 = Convert.ToHexString(incHash.GetHashAndReset());
+                throw new InvalidOperationException("격리 사본이 복원 가능 형식 검증을 통과하지 못해 원본 파일을 보존하고 중단했습니다.");
             }
         }
         catch
@@ -206,7 +241,8 @@ public sealed class QuarantineManager
             reason,
             sha256,
             fileSize,
-            QuarantineDisposition.PendingOriginalRemoval);
+            QuarantineDisposition.PendingOriginalRemoval,
+            encryptionFormat);
 
         try
         {
@@ -263,6 +299,175 @@ public sealed class QuarantineManager
         }
 
         return entry;
+    }
+
+    private void WriteSingleShotAesGcm(string qFilePath, byte[] plain)
+    {
+        var key = GetOrCreateAesKey();
+        var nonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
+        var cipher = new byte[plain.Length];
+        var tag = new byte[GcmTagSize];
+        using (var aes = new AesGcm(key, GcmTagSize))
+        {
+            aes.Encrypt(nonce, plain, cipher, tag, AesGcmMagicHeader);
+        }
+
+        using var output = new FileStream(qFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        output.Write(AesGcmMagicHeader, 0, AesGcmMagicHeader.Length);
+        output.Write(nonce, 0, nonce.Length);
+        output.Write(tag, 0, tag.Length);
+        output.Write(cipher, 0, cipher.Length);
+        output.Flush(flushToDisk: true);
+    }
+
+    private (long FileSize, string Sha256) WriteChunkedAesGcm(string qFilePath, Stream? prefixStream, Stream tailStream)
+    {
+        var key = GetOrCreateAesKey();
+        var baseNonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
+        int chunkSize = _chunkedGcmChunkSize;
+
+        using var incHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var aes = new AesGcm(key, GcmTagSize);
+        using var output = new FileStream(qFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+
+        // AEGISQ3 Header: Magic(8) + BaseNonce(12) + ChunkSize(4 LE)
+        output.Write(ChunkedAesGcmMagicHeader, 0, ChunkedAesGcmMagicHeader.Length);
+        output.Write(baseNonce, 0, baseNonce.Length);
+        Span<byte> sizeBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, (uint)chunkSize);
+        output.Write(sizeBytes);
+
+        var curBuf = new byte[chunkSize];
+        var nextBuf = new byte[chunkSize];
+        var cipherBuf = new byte[chunkSize];
+        var tag = new byte[GcmTagSize];
+        var chunkNonce = new byte[GcmNonceSize];
+        var aad = new byte[21]; // Magic(8) + ChunkIndex(8) + Flags(1) + PlainLen(4)
+        var frameHeader = new byte[5]; // Flags(1) + PlainLen(4)
+
+        try
+        {
+            long totalPlainBytes = 0;
+            ulong chunkIndex = 0;
+            int curLen = ReadCombinedFull(prefixStream, tailStream, curBuf, chunkSize);
+
+            while (true)
+            {
+                int nextLen = curLen > 0 ? ReadCombinedFull(prefixStream, tailStream, nextBuf, chunkSize) : 0;
+                bool isFinal = nextLen == 0;
+                byte flags = isFinal ? ChunkFlagFinal : ChunkFlagIntermediate;
+
+                if (curLen > 0)
+                {
+                    incHash.AppendData(curBuf, 0, curLen);
+                    totalPlainBytes += curLen;
+                }
+
+                DeriveChunkNonce(baseNonce, chunkIndex, chunkNonce);
+                BuildChunkAad(chunkIndex, flags, (uint)curLen, aad);
+                aes.Encrypt(chunkNonce, curBuf.AsSpan(0, curLen), cipherBuf.AsSpan(0, curLen), tag, aad);
+
+                frameHeader[0] = flags;
+                BinaryPrimitives.WriteUInt32LittleEndian(frameHeader.AsSpan(1, 4), (uint)curLen);
+                output.Write(frameHeader, 0, frameHeader.Length);
+                output.Write(tag, 0, tag.Length);
+                if (curLen > 0)
+                {
+                    output.Write(cipherBuf, 0, curLen);
+                }
+
+                if (isFinal)
+                {
+                    break;
+                }
+
+                chunkIndex++;
+                (curBuf, nextBuf) = (nextBuf, curBuf);
+                curLen = nextLen;
+            }
+
+            output.Flush(flushToDisk: true);
+            return (totalPlainBytes, Convert.ToHexString(incHash.GetHashAndReset()));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(curBuf);
+            CryptographicOperations.ZeroMemory(nextBuf);
+        }
+    }
+
+    private static int ReadCombinedFull(Stream? prefix, Stream tail, byte[] buffer, int maxCount)
+    {
+        int total = 0;
+        if (prefix is not null)
+        {
+            while (total < maxCount)
+            {
+                int r = prefix.Read(buffer, total, maxCount - total);
+                if (r <= 0) break;
+                total += r;
+            }
+        }
+        while (total < maxCount)
+        {
+            int r = tail.Read(buffer, total, maxCount - total);
+            if (r <= 0) break;
+            total += r;
+        }
+        return total;
+    }
+
+    private static void DeriveChunkNonce(ReadOnlySpan<byte> baseNonce, ulong chunkIndex, Span<byte> destNonce)
+    {
+        baseNonce.CopyTo(destNonce);
+        Span<byte> counter = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(counter, chunkIndex);
+        for (int i = 0; i < 8; i++)
+        {
+            destNonce[4 + i] ^= counter[i];
+        }
+    }
+
+    private static void BuildChunkAad(ulong chunkIndex, byte flags, uint plainLen, Span<byte> aad)
+    {
+        ChunkedAesGcmMagicHeader.CopyTo(aad[..8]);
+        BinaryPrimitives.WriteUInt64LittleEndian(aad.Slice(8, 8), chunkIndex);
+        aad[16] = flags;
+        BinaryPrimitives.WriteUInt32LittleEndian(aad.Slice(17, 4), plainLen);
+    }
+
+    private static bool IsQuarantineArtifactRestorable(string qFilePath, long maxSingleShotBytes)
+    {
+        try
+        {
+            using var fs = new FileStream(qFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var header = new byte[8];
+            if (fs.Read(header, 0, header.Length) != 8) return false;
+
+            if (header.SequenceEqual(AesGcmMagicHeader))
+            {
+                long minHeader = 8 + GcmNonceSize + GcmTagSize;
+                if (fs.Length < minHeader) return false;
+                long cipherLen = fs.Length - minHeader;
+                return cipherLen >= 0 && cipherLen <= Math.Min(maxSingleShotBytes, MaxInMemoryGcmBytes);
+            }
+
+            if (header.SequenceEqual(ChunkedAesGcmMagicHeader))
+            {
+                if (fs.Length < 8 + GcmNonceSize + 4 + 5 + GcmTagSize) return false;
+                fs.Seek(8 + GcmNonceSize, SeekOrigin.Begin);
+                var sizeBuf = new byte[4];
+                if (fs.Read(sizeBuf, 0, 4) != 4) return false;
+                uint chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(sizeBuf);
+                return chunkSize >= 1 && chunkSize <= MaxChunkedGcmChunkSize;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void WriteMetadataAtomic(string metaPath, string json)
@@ -436,9 +641,9 @@ public sealed class QuarantineManager
                         }
 
                         long rawCipherLen = input.Length - input.Position;
-                        if (rawCipherLen < 0 || rawCipherLen > MaxInMemoryGcmBytes)
+                        if (rawCipherLen < 0 || rawCipherLen > Math.Min(_maxInMemoryGcmBytes, MaxInMemoryGcmBytes))
                         {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 크기가 비정상적입니다.");
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 크기가 단일 AES-GCM 복원 상한을 초과했거나 비정상적입니다.");
                         }
 
                         int cipherLen = (int)rawCipherLen;
@@ -477,6 +682,112 @@ public sealed class QuarantineManager
                         finally
                         {
                             CryptographicOperations.ZeroMemory(plain);
+                        }
+                    }
+                    else if (header.SequenceEqual(ChunkedAesGcmMagicHeader))
+                    {
+                        var baseNonce = new byte[GcmNonceSize];
+                        var sizeBuf = new byte[4];
+                        if (!ReadExact(input, baseNonce, GcmNonceSize) || !ReadExact(input, sizeBuf, 4))
+                        {
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 헤더가 손상되었습니다.");
+                        }
+
+                        uint chunkSizeU32 = BinaryPrimitives.ReadUInt32LittleEndian(sizeBuf);
+                        if (chunkSizeU32 < 1 || chunkSizeU32 > MaxChunkedGcmChunkSize)
+                        {
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 블록 크기가 허용 범위를 벗어났습니다.");
+                        }
+
+                        int chunkSize = (int)chunkSizeU32;
+                        var frameHeader = new byte[5];
+                        var tag = new byte[GcmTagSize];
+                        var cipherBuf = new byte[chunkSize];
+                        var plainBuf = new byte[chunkSize];
+                        var chunkNonce = new byte[GcmNonceSize];
+                        var aad = new byte[21];
+
+                        using var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize);
+                        using var overrideBuffer = _writeRestoreTempOverride is not null ? new MemoryStream() : null;
+                        using var output = _writeRestoreTempOverride is null
+                            ? new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+                            : null;
+
+                        try
+                        {
+                            ulong chunkIndex = 0;
+                            bool sawFinalChunk = false;
+
+                            while (true)
+                            {
+                                if (!ReadExact(input, frameHeader, frameHeader.Length))
+                                {
+                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 스트림이 최종 청크 이전에 절단되었습니다.");
+                                }
+
+                                byte flags = frameHeader[0];
+                                if (flags != ChunkFlagIntermediate && flags != ChunkFlagFinal)
+                                {
+                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 플래그가 손상되었습니다.");
+                                }
+
+                                uint plainLenU32 = BinaryPrimitives.ReadUInt32LittleEndian(frameHeader.AsSpan(1, 4));
+                                if (plainLenU32 > chunkSizeU32)
+                                {
+                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 청크 길이가 비정상적입니다.");
+                                }
+
+                                int plainLen = (int)plainLenU32;
+                                if (!ReadExact(input, tag, GcmTagSize) ||
+                                    (plainLen > 0 && !ReadExact(input, cipherBuf, plainLen)))
+                                {
+                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 데이터가 불완전합니다.");
+                                }
+
+                                DeriveChunkNonce(baseNonce, chunkIndex, chunkNonce);
+                                BuildChunkAad(chunkIndex, flags, plainLenU32, aad);
+                                aes.Decrypt(chunkNonce, cipherBuf.AsSpan(0, plainLen), tag, plainBuf.AsSpan(0, plainLen), aad);
+
+                                if (plainLen > 0)
+                                {
+                                    if (overrideBuffer is not null)
+                                    {
+                                        overrideBuffer.Write(plainBuf, 0, plainLen);
+                                    }
+                                    else
+                                    {
+                                        output!.Write(plainBuf, 0, plainLen);
+                                    }
+                                }
+
+                                if (flags == ChunkFlagFinal)
+                                {
+                                    sawFinalChunk = true;
+                                    break;
+                                }
+
+                                chunkIndex++;
+                            }
+
+                            if (!sawFinalChunk || input.Position != input.Length)
+                            {
+                                return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 스트림 종료 경계 검증에 실패했습니다.");
+                            }
+
+                            if (overrideBuffer is not null)
+                            {
+                                var decrypted = overrideBuffer.ToArray();
+                                try { WriteRestoreTempFile(tmpDest, decrypted); }
+                                finally { CryptographicOperations.ZeroMemory(decrypted); }
+                            }
+                            else
+                            {
+                                output!.Flush(flushToDisk: true);
+                            }
+                        }
+                        finally
+                        {
+                            CryptographicOperations.ZeroMemory(plainBuf);
                         }
                     }
                     else if (header.SequenceEqual(LegacyMagicHeader))
@@ -604,6 +915,18 @@ public sealed class QuarantineManager
         {
             return new QuarantineRestoreResult(QuarantineRestoreStatus.WriteFailed, destination, $"파일 쓰기/복원 실패: {ex.Message}");
         }
+    }
+
+    private static bool ReadExact(Stream stream, byte[] buffer, int count)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int r = stream.Read(buffer, offset, count - offset);
+            if (r <= 0) return false;
+            offset += r;
+        }
+        return true;
     }
 
     private void WriteRestoreTempFile(string tempPath, byte[] plain)

@@ -719,17 +719,40 @@ public sealed class ContainmentSafetyRegressionTests : IDisposable
     [Fact]
     public void P1_5_LegacyAegisQ1StreamingPath_DetectsConflict_PreservesExistingOnWriteFailure_And_RestoresAtomically()
     {
-        var dir = Path.Combine(_tempRoot, "aegisq1_streaming");
+        var dir = Path.Combine(_tempRoot, "aegisq1_legacy_compat");
         Directory.CreateDirectory(dir);
 
-        var target = Path.Combine(dir, "large_archive_sim.bin");
+        var target = Path.Combine(dir, "legacy_archive_sim.bin");
         var originalBytes = RandomNumberGenerator.GetBytes(8192);
-        File.WriteAllBytes(target, originalBytes);
+        var sha256 = Convert.ToHexString(SHA256.HashData(originalBytes));
 
-        // Set GCM threshold to 64 bytes so this 8 KB file deterministically exercises the real AEGISQ1 streaming quarantine & restore path.
-        var qm = new QuarantineManager(dir, maxInMemoryGcmBytes: 64);
-        var entry = qm.QuarantineFile(target, "AEGISQ1 streaming test");
-        Assert.False(File.Exists(target));
+        // Craft an authentic legacy AEGISQ1\0 quarantine artifact + metadata JSON on disk
+        // to guarantee backward-compatible atomic restore for files quarantined before AEGISQ3.
+        var qm = new QuarantineManager(dir);
+        var entryId = "20261120120000_legacy0001";
+        var qFilePath = Path.Combine(qm.QuarantineDirectory, $"{entryId}.aegisq");
+        var metaPath = Path.Combine(qm.QuarantineDirectory, $"{entryId}.json");
+
+        byte[] legacyKey = { 0x5A, 0xA3, 0x19, 0xE7, 0x4C, 0x81, 0xD2, 0x3F, 0x9B, 0x24, 0x6E, 0xC8, 0x11, 0x77, 0xF0, 0x55 };
+        using (var fs = new FileStream(qFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            fs.Write(Encoding.ASCII.GetBytes("AEGISQ1\0"));
+            var obf = (byte[])originalBytes.Clone();
+            for (int i = 0; i < obf.Length; i++) obf[i] ^= legacyKey[i % legacyKey.Length];
+            fs.Write(obf);
+        }
+
+        var entry = new QuarantineEntry(
+            entryId,
+            target,
+            qFilePath,
+            DateTimeOffset.Now,
+            "Legacy AEGISQ1 restore test",
+            sha256,
+            originalBytes.Length,
+            QuarantineDisposition.RemovedImmediately,
+            QuarantineManager.FormatLegacyXor);
+        File.WriteAllText(metaPath, System.Text.Json.JsonSerializer.Serialize(entry));
 
         // Confirm on-disk file header is literally AEGISQ1\0
         var header = new byte[8];
@@ -757,8 +780,7 @@ public sealed class ContainmentSafetyRegressionTests : IDisposable
             {
                 File.WriteAllBytes(tmpPath, data.Take(16).ToArray());
                 throw new IOException("Simulated disk full in AEGISQ1 restore");
-            },
-            maxInMemoryGcmBytes: 64);
+            });
         var writeFailed = failingQm.RestoreFileDetailed(entry.Id, overwriteExisting: true);
         Assert.Equal(QuarantineRestoreStatus.WriteFailed, writeFailed.Status);
         Assert.Equal(expectedUserHash, Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(target))));

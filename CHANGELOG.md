@@ -9,6 +9,22 @@
 
 ---
 
+## [1.2.0] - 2026-11-27
+
+### 추가 (Added)
+- **청크 인증 스트리밍 암호화 포맷 `AEGISQ3` (`QuarantineManager`)**: 64 MiB 초과 대용량 파일 및 격리 도중 크기가 증가한 파일에 고정 키 XOR(`AEGISQ1`) 대신 청크 단위 **AES-256-GCM AEAD**(`AEGISQ3\0` 헤더, 12바이트 랜덤 기본 Nonce ⊕ 64비트 청크 인덱스, AAD에 매직·청크 인덱스·최종 청크 플래그·평문 길이 바인딩)를 적용해 청크 변조·재배치·절단·후미 확장을 암호학적으로 차단.
+- **격리 아티팩트 실제 암호화 형식 기록 (`QuarantineEntry.EncryptionFormat`)**: 메타데이터와 `SecurityOrchestrator` 감사 로그(`ContainmentDetail`)에 실제 사용된 암호화 형식(`AES-256-GCM` vs `AES-256-GCM-Chunked`)을 정확히 기록.
+- **재현 가능한 정량 벤치마크 스위트 및 문서 (`RansomwareDefenseBenchmarkTests` · `docs/BENCHMARKS.md`)**: 문서 피해 최소화·100% SHA-256 복구(`0/50` 변조, `20 ms`, `50/50` 복구), 정상 작업 1,000회 오동결 `0건`(`155.02 µs/op`), 6대 장애 주입 무손실(`6/6`) 벤치마크 추가.
+
+### 수정 (Fixed)
+- **격리 중 파일 크기 증가 경계 돌파 복원 불가 결함 수정 (`P1`)**: `QuarantineFile()`이 단일 AES-GCM(`AEGISQ2`) 읽기 상한(`effectiveInMemoryLimit + 1`)을 초과하는 즉시 버퍼링된 바이트와 남은 스트림을 끊김 없이 `AEGISQ3` 청크 AES-256-GCM으로 자동 전환(Spill)하며, 원본 삭제 전 `IsQuarantineArtifactRestorable()`로 복원 가능 형식을 검증.
+- **레거시 `AEGISQ1` 하위 호환 복원 유지**: 기존에 격리된 `AEGISQ1\0` 파일은 복원 경로에서 계속 안전하게 임시 파일 검증·원자적 복원 지원.
+
+### 테스트 (Tests)
+- `QuarantineChunkedAeadRegressionTests` 3종(대용량 `AEGISQ3`·감사 형식, 격리 중 크기 증가 자동 전환·원본 바이트 100% 복원, 1비트 변조/절단/후미 확장 거부 및 0바이트·정확한 청크 경계 검증) + `RansomwareDefenseBenchmarkTests` 3종 추가 (전체 **62 / 62 통과**).
+
+---
+
 ## [1.1.2] - 2026-11-26
 
 ### 수정 (Fixed)
@@ -71,7 +87,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.0.1...v1.1.0

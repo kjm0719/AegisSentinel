@@ -435,7 +435,8 @@ public sealed record QuarantineEntry(
     string Reason,
     string Sha256,
     long FileSize,
-    QuarantineDisposition Disposition = QuarantineDisposition.RemovedImmediately);
+    QuarantineDisposition Disposition = QuarantineDisposition.RemovedImmediately,
+    string EncryptionFormat = "AES-256-GCM");
 
 public sealed record VaultSnapshotEntry(
     string Id,

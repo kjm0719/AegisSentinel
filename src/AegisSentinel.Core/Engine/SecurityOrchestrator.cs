@@ -831,21 +831,24 @@ public sealed class SecurityOrchestrator : IDisposable
                 var qEntry = _quarantineManager.QuarantineFile(fileToQuarantine, evt.Title);
                 qDisposition = qEntry.Disposition;
                 evt.QuarantineDisposition = qEntry.Disposition;
+                var formatLabel = string.IsNullOrWhiteSpace(qEntry.EncryptionFormat)
+                    ? QuarantineManager.FormatAesGcmSingleShot
+                    : qEntry.EncryptionFormat;
                 switch (qEntry.Disposition)
                 {
                     case QuarantineDisposition.RemovedImmediately:
                         quarantineRemovedOrScheduled = true;
                         evt.ActionTaken = SecurityActionTaken.Quarantined;
-                        detailParts.Add("원본 제거 및 AES-256-GCM 격리 완료");
+                        detailParts.Add($"원본 제거 및 {formatLabel} 격리 완료");
                         break;
                     case QuarantineDisposition.ScheduledDeleteOnReboot:
                         quarantineRemovedOrScheduled = true;
                         evt.ActionTaken = SecurityActionTaken.QuarantinePendingReboot;
-                        detailParts.Add("격리 사본 보관 완료 · 원본은 재부팅 시 OS 자동 삭제 예약됨");
+                        detailParts.Add($"{formatLabel} 격리 사본 보관 완료 · 원본은 재부팅 시 OS 자동 삭제 예약됨");
                         break;
                     case QuarantineDisposition.CopyOnlyOriginalLocked:
                         quarantineRemovedOrScheduled = false;
-                        detailParts.Add("원본 파일 잠금으로 격리 사본만 보관됨 (원본 미제거)");
+                        detailParts.Add($"원본 파일 잠금으로 {formatLabel} 격리 사본만 보관됨 (원본 미제거)");
                         break;
                 }
             }
