@@ -207,17 +207,27 @@ public sealed class ProcessController
     public bool TryGetTrackedSuspendedInstance(int pid, out ProcessInstanceIdentity? instance) =>
         _suspendedPids.TryGetValue(pid, out instance);
 
-    public bool TryGetProcessInstanceIdentity(int pid, out ProcessInstanceIdentity? identity)
+    public bool TryGetProcessInstanceIdentity(int pid, out ProcessInstanceIdentity? identity) =>
+        TryInspectProcessInstanceIdentity(pid, out identity, out _);
+
+    public bool TryInspectProcessInstanceIdentity(
+        int pid,
+        out ProcessInstanceIdentity? identity,
+        out ProcessIdentityVerificationStatus lookupStatus)
     {
         identity = null;
         if (pid <= 4)
         {
+            lookupStatus = ProcessIdentityVerificationStatus.ExitedOrReplaced;
             return false;
         }
 
-        var handle = _nativeOps.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, pid, out _);
+        var handle = _nativeOps.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, pid, out int openError);
         if (handle == IntPtr.Zero)
         {
+            lookupStatus = openError == NativeMethods.ERROR_INVALID_PARAMETER
+                ? ProcessIdentityVerificationStatus.ExitedOrReplaced
+                : ProcessIdentityVerificationStatus.LookupFailed;
             return false;
         }
 
@@ -225,12 +235,82 @@ public sealed class ProcessController
         {
             if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
             {
+                lookupStatus = ProcessIdentityVerificationStatus.ExitedOrReplaced;
                 return false;
             }
             _nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long creationTimeUtc);
             var exePath = _nativeOps.QueryExecutablePath(handle);
             identity = new ProcessInstanceIdentity(pid, creationTimeUtc, exePath);
+            lookupStatus = ProcessIdentityVerificationStatus.Matched;
             return true;
+        }
+        finally
+        {
+            _nativeOps.CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// Verifies a process instance using a single query handle and distinguishes
+    /// Matched, ExitedOrReplaced, and LookupFailed (never clearing tracking on LookupFailed).
+    /// </summary>
+    public ProcessIdentityVerificationStatus VerifyProcessInstanceIdentity(
+        int pid,
+        long expectedCreationTimeUtc,
+        string? expectedExecutablePath = null)
+    {
+        if (pid <= 4)
+        {
+            return ProcessIdentityVerificationStatus.ExitedOrReplaced;
+        }
+
+        var handle = _nativeOps.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, pid, out int openError);
+        if (handle == IntPtr.Zero)
+        {
+            if (openError == NativeMethods.ERROR_INVALID_PARAMETER)
+            {
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return ProcessIdentityVerificationStatus.ExitedOrReplaced;
+            }
+            return ProcessIdentityVerificationStatus.LookupFailed;
+        }
+
+        try
+        {
+            if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
+            {
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return ProcessIdentityVerificationStatus.ExitedOrReplaced;
+            }
+
+            switch (VerifyHandleCreationTime(handle, expectedCreationTimeUtc))
+            {
+                case InstanceIdentityMatch.Mismatched:
+                    RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                    return ProcessIdentityVerificationStatus.ExitedOrReplaced;
+
+                case InstanceIdentityMatch.LookupFailed:
+                    return ProcessIdentityVerificationStatus.LookupFailed;
+            }
+
+            if (!string.IsNullOrWhiteSpace(expectedExecutablePath))
+            {
+                var livePath = _nativeOps.QueryExecutablePath(handle);
+                if (string.IsNullOrWhiteSpace(livePath))
+                {
+                    if (expectedCreationTimeUtc == 0)
+                    {
+                        return ProcessIdentityVerificationStatus.LookupFailed;
+                    }
+                }
+                else if (!livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                    return ProcessIdentityVerificationStatus.ExitedOrReplaced;
+                }
+            }
+
+            return ProcessIdentityVerificationStatus.Matched;
         }
         finally
         {

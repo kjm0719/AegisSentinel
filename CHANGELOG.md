@@ -9,6 +9,18 @@
 
 ---
 
+## [1.1.2] - 2026-11-26
+
+### 수정 (Fixed)
+- **동결 유지 vs 종료 재시도 상태 분리 (`SecurityModels` · `SecurityOrchestrator`)**: `KillAndQuarantineResult`에서 `RemainingSuspendedChildPids`(`StillSuspendedByUs == true`만 포함)와 `RetryRequiredChildPids`(`TransientFailureRetryRequired` 포함)를 분리하고, `SecurityEvent.PendingTerminationRetryChildPids`를 신설. 한 번도 동결되지 않은 자식의 종료 핸들 열기가 실패해도 동결 목록이나 `_activeInterventionPids`에 잘못 들어가지 않아 후속 악성 이벤트가 정상적으로 계속 처리됨.
+- **부모 신원 사전 확인 3분류 (`ProcessController` · `SecurityOrchestrator`)**: `VerifyProcessInstanceIdentity()` 및 `TryInspectProcessInstanceIdentity()`가 `Matched` / `ExitedOrReplaced` / `LookupFailed`를 구분. 일시적 조회·권한 오류(`LookupFailed`) 시 부모·자손 종료를 보류하고 기존 동결 추적 상태를 유지해 다음 재시도에서 안전하게 처리.
+- **엄격 모드(Strict) 자동 종료 실패 시 사용자 경고 인계 (`SecurityOrchestrator`)**: 엄격 모드 자동 대응이 `KillAndQuarantineDetailed()` 결과를 확인해 실제 동결 대상이 남으면 `UserInterventionRequired`를 발생시켜 사용자가 종료를 재시도하거나 재개할 수 있도록 수정.
+
+### 테스트 (Tests)
+- `ContainmentFailurePathRegressionTests` 3종 추가 (엄격 모드 자식 종료 실패 → 사용자 개입 이벤트 1회 발생, 미동결 자식 종료 핸들 실패 → 재시도 목록 분리 및 후속 이벤트 처리, 부모 신원·경로 조회 실패 → 보류 및 재시도 성공 — 전체 **56 / 56 통과**).
+
+---
+
 ## [1.1.1] - 2026-11-26
 
 ### 수정 (Fixed)
@@ -59,7 +71,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.0.0...v1.0.1

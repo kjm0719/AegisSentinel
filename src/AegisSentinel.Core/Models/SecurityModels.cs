@@ -111,6 +111,13 @@ public sealed record ProcessTreeResumeResult(
     public bool AllCleared => !HasAnyPendingRetry;
 }
 
+public enum ProcessIdentityVerificationStatus
+{
+    Matched,
+    ExitedOrReplaced,
+    LookupFailed
+}
+
 public enum ProcessTerminationStatus
 {
     Terminated,
@@ -137,13 +144,23 @@ public sealed record KillAndQuarantineResult(
 {
     public IReadOnlyList<int> RemainingSuspendedChildPids =>
         ChildResults
-            .Where(r => r.StillSuspendedByUs || r.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
+            .Where(r => r.StillSuspendedByUs)
+            .Select(r => r.ProcessId)
+            .Distinct()
+            .ToList();
+
+    public IReadOnlyList<int> RetryRequiredChildPids =>
+        ChildResults
+            .Where(r => r.Status == ProcessTerminationStatus.TransientFailureRetryRequired)
             .Select(r => r.ProcessId)
             .Distinct()
             .ToList();
 
     public bool HasAnyPendingFrozenProcess =>
         RootStillSuspended || RemainingSuspendedChildPids.Count > 0;
+
+    public bool HasAnyTerminationRetryRequired =>
+        RootStatus == ProcessTerminationStatus.TransientFailureRetryRequired || RetryRequiredChildPids.Count > 0;
 }
 
 public enum SignatureStatus
@@ -214,6 +231,7 @@ public sealed class SecurityEvent
     public bool IsProcessSuspended { get; set; }
     public List<int> SuspendedChildProcessIds { get; set; } = new();
     public List<ProcessInstanceIdentity> SuspendedChildInstances { get; set; } = new();
+    public List<int> PendingTerminationRetryChildPids { get; set; } = new();
     public int AttemptedChildFreezeCount { get; set; }
     public bool? ProcessTerminationSucceeded { get; set; }
     public QuarantineDisposition? QuarantineDisposition { get; set; }

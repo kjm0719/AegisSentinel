@@ -48,6 +48,8 @@ public sealed class ContainmentFailurePathRegressionTests : IDisposable
         public bool IsSuspended { get; set; }
         public bool FailCreationTimeLookup { get; set; }
         public bool FailTerminate { get; set; }
+        public int? NextQueryOpenError { get; set; }
+        public int? NextTerminateOpenError { get; set; }
         public int? NextResumeNtStatus { get; set; }
         public int ResumeCalls { get; set; }
         public int TerminateCalls { get; set; }
@@ -71,6 +73,17 @@ public sealed class ContainmentFailurePathRegressionTests : IDisposable
             if (!_procs.TryGetValue(pid, out var p))
             {
                 lastWin32Error = 87;
+                return IntPtr.Zero;
+            }
+            // PROCESS_TERMINATE = 0x0001, PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            if ((desiredAccess & 0x0001u) != 0 && p.NextTerminateOpenError is int termErr)
+            {
+                lastWin32Error = termErr;
+                return IntPtr.Zero;
+            }
+            if (desiredAccess == 0x1000u && p.NextQueryOpenError is int queryErr)
+            {
+                lastWin32Error = queryErr;
                 return IntPtr.Zero;
             }
             lastWin32Error = 0;
@@ -432,5 +445,176 @@ public sealed class ContainmentFailurePathRegressionTests : IDisposable
 
         coordinator.OnActivePromptClosed(saturatedChildOnly);
         Assert.Same(queued, coordinator.ActiveEvent);
+    }
+
+    [Fact]
+    public void P1_StrictMode_ChildTerminateFailure_MustEmitUserInterventionRequired()
+    {
+        var dir = Path.Combine(_tempRoot, "p1_strict_handoff");
+        Directory.CreateDirectory(dir);
+
+        var store = new PolicyStore(dir);
+        var strictPolicy = GuardPolicy.CreateDefault();
+        strictPolicy.Mode = ProtectionMode.Strict;
+        strictPolicy.EnableEtwTelemetry = false;
+        store.Save(strictPolicy);
+
+        var parentExe = Path.Combine(dir, "strict_parent.exe");
+        File.WriteAllBytes(parentExe, Encoding.UTF8.GetBytes("STRICT-MODE-UNSIGNED-DROPPER"));
+
+        var fake = new FailureInjectingNativeOps();
+        var parent = fake.Register(74001, 133800000080010000L, parentExe);
+        var child = fake.Register(74002, 133800000080020000L, Path.Combine(dir, "strict_child.exe"));
+        child.FailTerminate = true;
+
+        var procCtrl = new ProcessController(nativeOps: fake);
+        using var orch = new SecurityOrchestrator(store, processController: procCtrl);
+        orch.TreeTracker.RecordStart(74001, 1000, "strict_parent", parentExe, "");
+        orch.TreeTracker.RecordStart(74002, 74001, "strict_child", child.ExecutablePath, "");
+
+        var interventions = new List<SecurityEvent>();
+        orch.UserInterventionRequired += e => interventions.Add(e);
+
+        var evt = new SecurityEvent
+        {
+            ProcessId = 74001,
+            ProcessName = "strict_parent",
+            ProcessPath = parentExe,
+            Category = ThreatCategory.Ransomware,
+            Severity = ThreatSeverity.Critical,
+            RiskScore = 95,
+            Title = "엄격 모드 자식 종료 실패 회귀",
+            Signature = new SignatureInfo(SignatureStatus.Unsigned, string.Empty)
+        };
+
+        orch.ProcessSecurityEvent(evt);
+
+        Assert.False(parent.IsAlive);
+        Assert.True(procCtrl.IsProcessSuspendedByUs(74002));
+        var promptEvt = Assert.Single(interventions);
+        Assert.Contains(74002, promptEvt.SuspendedChildProcessIds);
+        Assert.True(promptEvt.HasAnySuspendedProcess);
+    }
+
+    [Fact]
+    public void P1_UnfrozenChildTerminateOpenFailure_MustNotEnterFrozenListAndMustKeepProcessingEvents()
+    {
+        var dir = Path.Combine(_tempRoot, "p1_unfrozen_child");
+        Directory.CreateDirectory(dir);
+
+        var fake = new FailureInjectingNativeOps();
+        var parent = fake.Register(75001, 133800000085010000L, Path.Combine(dir, "root_proc.exe"));
+        var runningChild = fake.Register(75002, 133800000085020000L, Path.Combine(dir, "running_child.exe"));
+
+        var procCtrl = new ProcessController(nativeOps: fake);
+        // Only parent 75001 is suspended; child 75002 was NEVER suspended!
+        Assert.True(procCtrl.TrySuspendProcessDetailed(75001, out var rootInst));
+        Assert.False(procCtrl.IsProcessSuspendedByUs(75002));
+
+        // Child 75002 fails terminate handle open (ERROR_ACCESS_DENIED = 5), while still running unfrozen
+        runningChild.NextTerminateOpenError = 5;
+
+        var store = new PolicyStore(dir);
+        using var orch = new SecurityOrchestrator(store, processController: procCtrl);
+        orch.TreeTracker.RecordStart(75001, 1000, "root_proc", parent.ExecutablePath, "");
+        orch.TreeTracker.RecordStart(75002, 75001, "running_child", runningChild.ExecutablePath, "");
+
+        var evt = new SecurityEvent
+        {
+            ProcessId = 75001,
+            ProcessCreationTimeFileTimeUtc = rootInst!.CreationTimeFileTimeUtc,
+            ProcessName = "root_proc",
+            ProcessPath = parent.ExecutablePath,
+            Category = ThreatCategory.Ransomware,
+            Severity = ThreatSeverity.Critical,
+            ActionTaken = SecurityActionTaken.Suspended,
+            IsProcessSuspended = true
+        };
+
+        var res = orch.KillAndQuarantineDetailed(evt);
+
+        Assert.True(res.RootTerminated);
+        Assert.False(res.HasAnyPendingFrozenProcess);
+        Assert.True(res.HasAnyTerminationRetryRequired);
+        Assert.Contains(75002, res.RetryRequiredChildPids);
+        Assert.Contains(75002, evt.PendingTerminationRetryChildPids);
+        Assert.DoesNotContain(75002, res.RemainingSuspendedChildPids);
+        Assert.DoesNotContain(75002, evt.SuspendedChildProcessIds);
+        Assert.False(evt.HasAnySuspendedProcess);
+        Assert.False(procCtrl.IsProcessSuspendedByUs(75002));
+        Assert.Contains(res.ChildResults, r => r.ProcessId == 75002 && r.Status == ProcessTerminationStatus.TransientFailureRetryRequired && !r.StillSuspendedByUs);
+
+        // Because running child 75002 is NOT frozen and NOT in _activeInterventionPids, its follow-up events MUST still be processed!
+        var recorded = new List<SecurityEvent>();
+        orch.EventRecorded += e => recorded.Add(e);
+        orch.ProcessSecurityEvent(new SecurityEvent
+        {
+            ProcessId = 75002,
+            ProcessName = "running_child",
+            ProcessPath = runningChild.ExecutablePath,
+            Category = ThreatCategory.CredentialAccess,
+            Severity = ThreatSeverity.High,
+            RiskScore = 60,
+            Title = "미동결 자식 후속 악성 행위"
+        });
+
+        Assert.Contains(recorded, e => e.ProcessId == 75002);
+    }
+
+    [Fact]
+    public void P1_RootIdentityAndPathLookupFailure_MustHoldTerminationAndKeepFrozenStateUntilRetry()
+    {
+        var dir = Path.Combine(_tempRoot, "p1_root_lookup_fail");
+        Directory.CreateDirectory(dir);
+
+        var fake = new FailureInjectingNativeOps();
+        var parent = fake.Register(76001, 133800000090010000L, Path.Combine(dir, "frozen_root.exe"));
+        var descendant = fake.Register(76002, 133800000090020000L, Path.Combine(dir, "live_desc.exe"));
+
+        var procCtrl = new ProcessController(nativeOps: fake);
+        Assert.True(procCtrl.TrySuspendProcessDetailed(76001, out var rootInst));
+        Assert.True(procCtrl.IsProcessSuspendedByUs(76001));
+
+        var store = new PolicyStore(dir);
+        using var orch = new SecurityOrchestrator(store, processController: procCtrl);
+        orch.TreeTracker.RecordStart(76001, 1000, "frozen_root", parent.ExecutablePath, "");
+        orch.TreeTracker.RecordStart(76002, 76001, "live_desc", descendant.ExecutablePath, "");
+
+        var evt = new SecurityEvent
+        {
+            ProcessId = 76001,
+            ProcessCreationTimeFileTimeUtc = rootInst!.CreationTimeFileTimeUtc,
+            ProcessName = "frozen_root",
+            ProcessPath = parent.ExecutablePath,
+            Category = ThreatCategory.Ransomware,
+            Severity = ThreatSeverity.Critical,
+            ActionTaken = SecurityActionTaken.Suspended,
+            IsProcessSuspended = true
+        };
+
+        // 1. First attempt: both root identity & path query fail transiently (ERROR_ACCESS_DENIED = 5)
+        parent.NextQueryOpenError = 5;
+
+        var firstRes = orch.KillAndQuarantineDetailed(evt);
+        Assert.Equal(ProcessTerminationStatus.TransientFailureRetryRequired, firstRes.RootStatus);
+        Assert.True(firstRes.RootStillSuspended);
+        Assert.True(firstRes.HasAnyPendingFrozenProcess);
+        Assert.True(evt.IsProcessSuspended);
+        Assert.True(procCtrl.IsProcessSuspendedByUs(76001));
+        Assert.Equal(0, parent.TerminateCalls);
+        Assert.Equal(0, descendant.TerminateCalls);
+
+        // 2. Second attempt: lookup succeeds -> terminates both descendant and parent cleanly and clears freeze tracking!
+        parent.NextQueryOpenError = null;
+
+        var secondRes = orch.KillAndQuarantineDetailed(evt);
+        Assert.True(secondRes.RootTerminated);
+        Assert.Equal(ProcessTerminationStatus.Terminated, secondRes.RootStatus);
+        Assert.False(secondRes.RootStillSuspended);
+        Assert.False(secondRes.HasAnyPendingFrozenProcess);
+        Assert.False(evt.IsProcessSuspended);
+        Assert.False(parent.IsAlive);
+        Assert.False(descendant.IsAlive);
+        Assert.False(procCtrl.IsProcessSuspendedByUs(76001));
     }
 }
