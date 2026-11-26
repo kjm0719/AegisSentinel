@@ -1,0 +1,26 @@
+name: 기능 · 탐지 규칙 제안 (Feature / Detection Rule)
+description: 새로운 보안 탐지 기법, UI 개선, 성능 최적화 아이디어를 제안합니다.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 해결하려는 문제 또는 위협 시나리오
+      description: 어떤 공격 기법(MITRE ATT&CK ID 포함 가능)이나 사용성 불편을 해결하고 싶으신가요?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 제안하는 동작 방식
+      description: 기대하는 탐지 로직, UI 동작 또는 설정 방식을 설명해 주세요.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 오탐 위험 및 대안 고려사항
+      description: 정상 프로그램과의 충돌 가능성이나 고려해야 할 부작용이 있다면 적어 주세요.

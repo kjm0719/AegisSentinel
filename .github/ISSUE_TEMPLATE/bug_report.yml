@@ -1,0 +1,47 @@
+name: 버그 · 오탐 제보 (Bug / False Positive)
+description: 동작 오류, 크래시 또는 정상 프로그램 오탐(False Positive)을 제보합니다.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: report_type
+    attributes:
+      label: 제보 유형
+      options:
+        - 동작 버그 / 크래시
+        - 정상 프로그램 오탐 (False Positive)
+        - UI / 경고창 표시 문제
+        - 성능 / 메모리 / CPU 이슈
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 현상 설명
+      description: 어떤 상황에서 어떤 문제가 발생했는지 구체적으로 적어 주세요.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 재현 절차
+      description: 문제를 재현하는 단계를 순서대로 작성해 주세요.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 실행 환경 및 로그
+      description: Windows 버전, 관리자 권한 여부, 탐지된 프로세스명·경로·MITRE ID 또는 감사 로그 일부(개인정보 제외)를 적어 주세요.
+      placeholder: |
+        - OS: Windows 11 24H2 (x64)
+        - AegisSentinel 버전 / 커밋: v1.1.0
+        - 관리자 권한 실행 여부: 예 / 아니오
+        - 관련 탐지 정보:

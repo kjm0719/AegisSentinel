@@ -3,11 +3,14 @@
 > **Windows 10/11용 통합 엔드포인트 탐지·대응(EDR) 및 MZK급 6단계 심층 백신 플랫폼**  
 > 커널 ETW 실시간 감시 · 다단계 행위 상관분석 · O(1) 메모리 무제한 심층 파일 검사 · 상용 백신 초월 4대 탐지 엔진 · 원클릭 안전 치료 · MITRE ATT&CK 40개 기법 지원
 
+[![최신 릴리스](https://img.shields.io/github/v/release/kjm0719/AegisSentinel?label=릴리스&color=0EA5E9)](https://github.com/kjm0719/AegisSentinel/releases)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0--windows-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
 [![운영체제](https://img.shields.io/badge/운영체제-Windows%2010%2F11%20(x64)-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-40개%20기법%20%7C%2011개%20전술-E11D48)](docs/MITRE_ATTACK_COVERAGE.md)
-[![테스트](https://img.shields.io/badge/자동화%20테스트-38%2F38%20통과-22C55E)](tests/AegisSentinel.Tests/RedTeamSimulationTests.cs)
+[![테스트](https://img.shields.io/badge/자동화%20테스트-49%2F49%20통과-22C55E)](tests/AegisSentinel.Tests/ContainmentSafetyRegressionTests.cs)
 [![라이선스: MIT](https://img.shields.io/badge/라이선스-MIT-F59E0B.svg)](LICENSE)
+
+> **프로젝트 문서**: [변경 이력 (CHANGELOG)](CHANGELOG.md) · [보안 정책 (SECURITY)](SECURITY.md) · [기여 가이드 (CONTRIBUTING)](CONTRIBUTING.md) · [아키텍처](docs/ARCHITECTURE.md) · [위협 모델](docs/THREAT_MODEL.md)
 
 ---
 
@@ -149,7 +152,7 @@ flowchart TB
 
 ### 최종 검증 결과
 - **Release 클린 빌드 (`-warnaserror --no-incremental`)**: **경고 0개 · 오류 0개**
-- **자동화 테스트 & 레드팀 시뮬레이션**: **38 / 38 전체 통과** (실 PC 무제한 MZK 심층 스캔, 실 PC 실행 앱 오동결 0건, 자체 바이너리 자가 오탐 0건 포함)
+- **자동화 테스트 & 레드팀 시뮬레이션**: **49 / 49 전체 통과** (실제 Win32 실프로세스 신원 검증·실제 OS 파일 잠금·`AEGISQ1` 대용량 스트리밍·WPF STA UI 검증·실 PC 무제한 MZK 심층 스캔·자체 바이너리 자가 오탐 0건 포함)
 - **Windows Defender 정밀 스캔 (`MpCmdRun.exe`)**: **`found no threats`** (오탐 0건)
 - **테스트 임시 폴더 누수**: **`0건`**
 
@@ -168,7 +171,7 @@ flowchart TB
 # 1. 클린 Release 빌드 (모든 경고를 오류로 엄격 검사)
 dotnet build AegisSentinel.slnx -c Release -warnaserror
 
-# 2. 전체 38개 단위 · 레드팀 시뮬레이션 · 실환경 감사 테스트 실행
+# 2. 전체 49개 단위 · 레드팀 시뮬레이션 · 실환경 감사 테스트 실행
 dotnet test tests/AegisSentinel.Tests/AegisSentinel.Tests.csproj -c Release --no-build --verbosity normal
 
 # 3. WPF 통합 보안 센터 실행
@@ -183,7 +186,14 @@ dotnet test tests/AegisSentinel.Tests/AegisSentinel.Tests.csproj -c Release --no
 
 ```text
 AegisSentinel/
-├── .github/workflows/ci.yml        # GitHub Actions 자동 빌드(-warnaserror) 및 테스트 CI
+├── .github/
+│   ├── CODEOWNERS                  # 코드 소유자 지정
+│   ├── PULL_REQUEST_TEMPLATE.md    # PR 검증 체크리스트 템플릿
+│   ├── ISSUE_TEMPLATE/             # 버그·오탐 제보 / 기능 제안 YAML 이슈 폼
+│   └── workflows/ci.yml            # GitHub Actions 자동 빌드(-warnaserror) 및 테스트 CI
+├── CHANGELOG.md                    # Keep a Changelog + SemVer 기반 변경 이력
+├── CONTRIBUTING.md                 # 브랜치 전략 · Conventional Commits · 검증 규칙
+├── SECURITY.md                     # 보안 취약점 비공개 제보 정책 및 지원 버전
 ├── docs/
 │   ├── ARCHITECTURE.md             # 상세 아키텍처, 스트리밍 BFS, 암호화 격리, 최적화 설계서
 │   ├── THREAT_MODEL.md             # 보호 자산, 신뢰 경계, 공격자 모델, Ring-3 한계 및 커널 보완
@@ -191,13 +201,13 @@ AegisSentinel/
 │   └── INTERVIEW_GUIDE.md          # 정보보안 기술 심층 Q&A 12선 (실전 트러블슈팅 사례 포함)
 ├── src/
 │   ├── AegisSentinel.Core/         # 순수 탐지 · 대응 · 심층 백신 · 포렌식 코어 (.NET 10)
-│   │   ├── Engine/                 # 29개 핵심 탐지/분석/상관/심층스캔/치료 엔진
+│   │   ├── Engine/                 # 30개 핵심 탐지/분석/상관/경고큐/심층스캔/치료 엔진
 │   │   ├── Services/               # Win32 Catalog 서명, 해시 DB, AES-GCM 격리소, 복구금고, WFP, 자가방어
-│   │   ├── Models/                 # 보안 이벤트, 정책 모델, MZK 스캔 모델, MITRE 40기법 카탈로그
-│   │   └── Native/                 # Win32 P/Invoke (NtSuspendProcess, WinTrust/Catalog, RestartManager 등)
+│   │   ├── Models/                 # 보안 이벤트(Schema v2), 정책 모델, MZK 스캔 모델, MITRE 40기법 카탈로그
+│   │   └── Native/                 # Win32 P/Invoke (GetProcessTimes, NtSuspendProcess, WinTrust/Catalog, FlushFileBuffers 등)
 │   └── AegisSentinel.App/          # WPF 다크모드 통합 대시보드 · 트레이 상주 · 단일 FIFO 경고창
 └── tests/
-    └── AegisSentinel.Tests/        # 38개 단위 · 레드팀 · MZK · 4대 초월엔진 · 코드리뷰 회귀 테스트
+    └── AegisSentinel.Tests/        # 49개 단위 · 레드팀 · 실Win32 · WPF STA · 격리 안전성 회귀 테스트
 ```
 
 ---
