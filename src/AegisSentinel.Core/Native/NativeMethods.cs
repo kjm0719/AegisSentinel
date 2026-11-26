@@ -43,12 +43,46 @@ internal static partial class NativeMethods
     public static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
 
     public const uint MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004;
+    public const uint GENERIC_READ = 0x80000000;
     public const uint GENERIC_WRITE = 0x40000000;
+    public const uint DELETE_ACCESS = 0x00010000;
     public const uint FILE_SHARE_READ = 0x00000001;
     public const uint FILE_SHARE_WRITE = 0x00000002;
     public const uint FILE_SHARE_DELETE = 0x00000004;
     public const uint OPEN_EXISTING = 3;
+    public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    public const int ERROR_FILE_NOT_FOUND = 2;
+    public const int ERROR_PATH_NOT_FOUND = 3;
+    public const int ERROR_ACCESS_DENIED = 5;
+    public const int ERROR_SHARING_VIOLATION = 32;
+    public const int FileDispositionInfo = 4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_DISPOSITION_INFO
+    {
+        [MarshalAs(UnmanagedType.U1)]
+        public bool DeleteFile;
+    }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -67,6 +101,20 @@ internal static partial class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool FlushFileBuffers(IntPtr hFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(
+        IntPtr hFile,
+        out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetFileInformationByHandle(
+        IntPtr hFile,
+        int fileInformationClass,
+        ref FILE_DISPOSITION_INFO lpFileInformation,
+        uint dwBufferSize);
 
     [DllImport("ntdll.dll")]
     public static extern int NtSuspendProcess(IntPtr processHandle);

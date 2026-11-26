@@ -183,4 +183,116 @@ public sealed class QuarantineChunkedAeadRegressionTests : IDisposable
         Assert.Equal(QuarantineRestoreStatus.Restored, qm.RestoreFileDetailed(tamperEntry.Id).Status);
         Assert.Equal(tamperPayload, File.ReadAllBytes(tamperTarget));
     }
+
+    [Fact]
+    public void P1_OriginalReplacedAfterCopySaved_MustPreserveNewFileAndNeverScheduleRebootDelete()
+    {
+        var dir = Path.Combine(_tempRoot, "toctou_replace");
+        Directory.CreateDirectory(dir);
+
+        var target = Path.Combine(dir, "app_binary.exe");
+        var oldBytes = Encoding.UTF8.GetBytes("OLD-VERSION-READ-INTO-QUARANTINE-0001");
+        var newBytes = Encoding.UTF8.GetBytes("BRAND-NEW-VERSION-SAVED-BY-APP-MUST-NOT-BE-DELETED-9999");
+        File.WriteAllBytes(target, oldBytes);
+
+        int rebootScheduleCalls = 0;
+        bool replacedOnce = false;
+        var qm = new QuarantineManager(
+            dir,
+            scheduleRebootDeleteOverride: _ => { rebootScheduleCalls++; return true; },
+            writeMetadataOverride: (metaPath, json) =>
+            {
+                File.WriteAllText(metaPath, json);
+                // Simulate another application replacing target with a brand-new file
+                // right after quarantine copy + metadata are saved and before original deletion!
+                if (!replacedOnce)
+                {
+                    replacedOnce = true;
+                    var replacementTmp = Path.Combine(dir, "new_version.tmp");
+                    File.WriteAllBytes(replacementTmp, newBytes);
+                    File.Replace(replacementTmp, target, destinationBackupFileName: null, ignoreMetadataErrors: true);
+                }
+            });
+
+        var entry = qm.QuarantineFile(target, "TOCTOU replacement test");
+
+        Assert.True(replacedOnce);
+        Assert.True(File.Exists(target), "New replacement file saved after quarantine read MUST NOT be deleted!");
+        Assert.Equal(newBytes, File.ReadAllBytes(target));
+        Assert.Equal(0, rebootScheduleCalls);
+        Assert.Equal(QuarantineDisposition.OriginalChangedNotRemoved, entry.Disposition);
+    }
+
+    [Fact]
+    public void P1_OriginalModifiedInPlaceAfterCopySaved_MustPreserveModifiedFileAndNeverDelete()
+    {
+        var dir = Path.Combine(_tempRoot, "toctou_inplace");
+        Directory.CreateDirectory(dir);
+
+        var target = Path.Combine(dir, "in_place_binary.exe");
+        var oldBytes = Encoding.UTF8.GetBytes("ORIGINAL-CONTENT-AAAA-1111");
+        var updatedBytes = Encoding.UTF8.GetBytes("UPDATED-IN-PLACE-BBBB-2222"); // Same length & same NTFS File ID!
+        File.WriteAllBytes(target, oldBytes);
+
+        int rebootScheduleCalls = 0;
+        bool modifiedOnce = false;
+        var qm = new QuarantineManager(
+            dir,
+            scheduleRebootDeleteOverride: _ => { rebootScheduleCalls++; return true; },
+            writeMetadataOverride: (metaPath, json) =>
+            {
+                File.WriteAllText(metaPath, json);
+                if (!modifiedOnce)
+                {
+                    modifiedOnce = true;
+                    using var fs = new FileStream(target, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                    fs.Seek(0, SeekOrigin.Begin);
+                    fs.Write(updatedBytes, 0, updatedBytes.Length);
+                    fs.Flush(flushToDisk: true);
+                }
+            });
+
+        var entry = qm.QuarantineFile(target, "TOCTOU in-place modification test");
+
+        Assert.True(modifiedOnce);
+        Assert.True(File.Exists(target), "In-place modified file must NOT be deleted!");
+        Assert.Equal(updatedBytes, File.ReadAllBytes(target));
+        Assert.Equal(0, rebootScheduleCalls);
+        Assert.Equal(QuarantineDisposition.OriginalChangedNotRemoved, entry.Disposition);
+    }
+
+    [Fact]
+    public void P2_PreDeleteVerification_MissingFinalChunkInAegisQ3_MustAbortAndPreserveOriginal()
+    {
+        var dir = Path.Combine(_tempRoot, "predelete_truncated_chunk");
+        Directory.CreateDirectory(dir);
+
+        var target = Path.Combine(dir, "chunked_target.exe");
+        var payload = RandomNumberGenerator.GetBytes(12 * 1024); // 3 chunks of 4 KiB
+        File.WriteAllBytes(target, payload);
+
+        int rebootScheduleCalls = 0;
+        bool truncatedFinalChunk = false;
+        var qm = new QuarantineManager(
+            dir,
+            scheduleRebootDeleteOverride: _ => { rebootScheduleCalls++; return true; },
+            maxInMemoryGcmBytes: 0,
+            chunkedGcmChunkSize: 4 * 1024,
+            onAfterArtifactWrittenBeforeVerifyForTest: qPath =>
+            {
+                // Drop the entire final chunk (~4 KiB + 21B frame/tag) right after write and BEFORE pre-delete verify!
+                truncatedFinalChunk = true;
+                var raw = File.ReadAllBytes(qPath);
+                File.WriteAllBytes(qPath, raw[..(raw.Length - (4 * 1024 + 21))]);
+            });
+
+        Assert.Throws<InvalidOperationException>(() => qm.QuarantineFile(target, "Missing final chunk pre-delete check"));
+
+        Assert.True(truncatedFinalChunk);
+        Assert.True(File.Exists(target), "Original file MUST remain untouched when pre-delete verification detects missing final chunk!");
+        Assert.Equal(payload, File.ReadAllBytes(target));
+        Assert.Equal(0, rebootScheduleCalls);
+        Assert.Empty(qm.ListEntries());
+        Assert.Empty(Directory.GetFiles(qm.QuarantineDirectory, "*.aegisq"));
+    }
 }

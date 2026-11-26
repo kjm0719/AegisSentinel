@@ -850,6 +850,10 @@ public sealed class SecurityOrchestrator : IDisposable
                         quarantineRemovedOrScheduled = false;
                         detailParts.Add($"원본 파일 잠금으로 {formatLabel} 격리 사본만 보관됨 (원본 미제거)");
                         break;
+                    case QuarantineDisposition.OriginalChangedNotRemoved:
+                        quarantineRemovedOrScheduled = false;
+                        detailParts.Add($"격리 중 원본 파일이 변경/교체되어 새 파일을 보존하고 {formatLabel} 사본만 보관됨");
+                        break;
                 }
             }
             catch (Exception ex)
@@ -907,7 +911,7 @@ public sealed class SecurityOrchestrator : IDisposable
         }
         else
         {
-            evt.ActionTaken = qDisposition == QuarantineDisposition.CopyOnlyOriginalLocked
+            evt.ActionTaken = qDisposition is QuarantineDisposition.CopyOnlyOriginalLocked or QuarantineDisposition.OriginalChangedNotRemoved
                 ? SecurityActionTaken.QuarantineCopyOnly
                 : (hasPendingFrozen ? SecurityActionTaken.Suspended : SecurityActionTaken.Logged);
             overallSuccess = false;

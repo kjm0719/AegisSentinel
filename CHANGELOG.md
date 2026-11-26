@@ -9,6 +9,18 @@
 
 ---
 
+## [1.2.1] - 2026-11-27
+
+### 수정 (Fixed)
+- **격리 읽기↔삭제 TOCTOU 차단 (`P1`, `QuarantineManager` · `NativeMethods` · `SecurityModels` · `SecurityOrchestrator`)**: 격리 입력 파일 읽기 시 Win32 `GetFileInformationByHandle`로 NTFS 파일 식별자(`VolumeSerialNumber`, `FileIndexHigh/Low`)와 SHA-256을 확보하고, 삭제 단계에서는 쓰기·교체를 차단하는 단일 핸들(`GENERIC_READ | DELETE`, `FILE_SHARE_READ`)에서 동일 NTFS 파일 객체 및 SHA-256을 재검증한 뒤 `SetFileInformationByHandle(FileDispositionInfo)`로 핸들 자체를 삭제. 사본 저장 직후 같은 경로에 새 파일로 교체되거나 제자리 수정된 경우 삭제와 재부팅 삭제 예약을 모두 차단하고 `QuarantineDisposition.OriginalChangedNotRemoved`를 반환해 새 파일을 보존.
+- **삭제 전 전체 청크 암호화 스트리밍 검증 통일 (`P2`, `QuarantineManager`)**: 기존 헤더·길이 위주 검사를 제거하고, `QuarantineFile()`의 사전 검증과 `RestoreFileDetailed()`가 동일한 `DecryptAndVerifyQuarantineStream()` 경로(`Stream.Null` 대상 복호화·모든 청크 AES-GCM 태그/AAD·최종 청크 경계·전체 SHA-256 검증)를 공유하도록 통일. 마지막 청크가 유실된 손상 사본은 원본 삭제 전에 즉시 차단.
+- **실제 별도 OS 프로세스 A/B 랜섬웨어 벤치마크 및 문서 정확도 개선 (`P2`, `RansomwareDefenseBenchmarkTests` · `docs/BENCHMARKS.md`)**: 기존 미끼 우선 규칙 테스트를 `Benchmark_01A_CanaryFirstRuleReaction_UnitBaseline`으로 명확히 표기 분리하고, 별도의 `powershell.exe` 자식 프로세스를 보호 전·후 동일 순서로 실행해 실제 `NtSuspendProcess` 동결 전 변조 문서 수(`20/20 → 3/20`, `1,059 ms` 동결)와 `RecoveryVault` 복구(`20/20`, 100%)를 실측하는 `Benchmark_01B` 추가.
+
+### 테스트 (Tests)
+- `QuarantineChunkedAeadRegressionTests` 3종(사본 저장 후 파일 교체 보존, 제자리 수정 보존, `AEGISQ3` 마지막 청크 유실 사전 검증 차단) + `Benchmark_01B` 실제 별도 프로세스 A/B 비교 추가 (전체 **66 / 66 통과**).
+
+---
+
 ## [1.2.0] - 2026-11-27
 
 ### 추가 (Added)
@@ -87,7 +99,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.0...v1.1.1

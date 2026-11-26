@@ -9,10 +9,11 @@ using AegisSentinel.Core.Services;
 namespace AegisSentinel.Tests;
 
 /// <summary>
-/// Reproducible, safe benchmark suite answering the three core quantitative user-outcome questions:
-/// 1. Document damage reduction & SHA-256 verified recovery under simulated ransomware
-/// 2. False-freeze rate & per-operation latency overhead across benign dev/game/update/backup workflows
-/// 3. User-data preservation rate under injected fault conditions
+/// Reproducible, safe benchmark suite answering three core quantitative questions:
+/// 1A. Canary-first rule-reaction unit baseline (in-process detector reaction, no OS freeze)
+/// 1B. Real separate-process ransomware A/B comparison (same temp-doc mutator process run BEFORE vs WITH live SecurityOrchestrator + Win32 NtSuspendProcess + RecoveryVault)
+/// 2. False-freeze rate & per-operation latency overhead across 1,000 benign operations
+/// 3. User-data preservation rate across 7 injected fault conditions
 /// </summary>
 public sealed class RansomwareDefenseBenchmarkTests : IDisposable
 {
@@ -43,9 +44,9 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
     }
 
     [Fact]
-    public void Benchmark_01_RansomwareDocumentProtection_MeasuresDamageReductionAnd100PercentSha256Recovery()
+    public void Benchmark_01A_CanaryFirstRuleReaction_UnitBaseline()
     {
-        var docsDir = Path.Combine(_tempRoot, "UserDocuments");
+        var docsDir = Path.Combine(_tempRoot, "CanaryUnitDocs");
         Directory.CreateDirectory(docsDir);
 
         const int totalDocs = 50;
@@ -53,13 +54,12 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
         for (int i = 0; i < totalDocs; i++)
         {
             var path = Path.Combine(docsDir, $"report_{i:D2}.txt");
-            var content = $"AegisSentinel Benchmark Document #{i:D2}\n" +
+            var content = $"AegisSentinel Rule Baseline Document #{i:D2}\n" +
                           string.Join("\n", Enumerable.Repeat($"Quarterly financial and engineering ledger line {i}.", 25));
             File.WriteAllText(path, content, Encoding.UTF8);
             originalHashes[path] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
         }
 
-        // Prepare RecoveryVault + Canary + RansomwareDetector
         var vault = new RecoveryVault(_tempRoot);
         var canaryMgr = new CanaryManager();
         var detector = new RansomwareDetector();
@@ -67,72 +67,214 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
         policy.ProtectedFolders = new List<string> { docsDir };
         policy.RapidWriteThresholdPer3Sec = 10;
 
-        int snapshotted = vault.SnapshotProtectedFolders(policy.ProtectedFolders);
-        Assert.Equal(totalDocs, snapshotted);
+        Assert.Equal(totalDocs, vault.SnapshotProtectedFolders(policy.ProtectedFolders));
         canaryMgr.DeployCanaries(policy.ProtectedFolders);
-        var canaryPath = canaryMgr.CanaryPaths.First();
 
-        // Simulate alphabetical ransomware encryption sweep (hits "!_00_aegis_canary..." first or rapid burst)
+        // Canary-first alphabetical rule-reaction test (in-process detector callback — NOT real OS freeze)
         var allTargets = Directory.GetFiles(docsDir).OrderBy(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase).ToList();
-        int attackerPid = 88001;
-        bool attackerFrozen = false;
-        int modifiedBeforeFreeze = 0;
+        bool ruleTriggered = false;
+        int modifiedBeforeRuleTrigger = 0;
         var sw = Stopwatch.StartNew();
 
         foreach (var file in allTargets)
         {
-            if (attackerFrozen) break;
-
+            if (ruleTriggered) break;
             bool isCanary = canaryMgr.IsCanaryPath(file);
             try { File.SetAttributes(file, FileAttributes.Normal); } catch { }
             File.WriteAllBytes(file, RandomNumberGenerator.GetBytes(8192));
-
-            if (!isCanary)
-            {
-                modifiedBeforeFreeze++;
-            }
+            if (!isCanary) modifiedBeforeRuleTrigger++;
 
             var alert = detector.RecordFileActivity(
-                attackerPid,
-                "sim_ransom.exe",
-                Path.Combine(_tempRoot, "sim_ransom.exe"),
-                file,
-                isRenameOrDelete: false,
-                isCanaryFile: isCanary,
-                policy);
-
-            if (alert is not null && alert.RiskScore >= 75)
-            {
-                attackerFrozen = true;
-            }
+                88001, "sim_ransom.exe", Path.Combine(_tempRoot, "sim_ransom.exe"),
+                file, isRenameOrDelete: false, isCanaryFile: isCanary, policy);
+            if (alert is not null && alert.RiskScore >= 75) ruleTriggered = true;
         }
         sw.Stop();
+        canaryMgr.RemoveCanaries();
 
-        Assert.True(attackerFrozen, "Ransomware simulator must be caught and frozen!");
-        // Because canary file sorts first ("!_00_..."), damage before freeze should be minimal (0 or well under totalDocs)
-        Assert.True(modifiedBeforeFreeze <= 10, $"Expected <= 10 modified docs before freeze, got {modifiedBeforeFreeze}/{totalDocs}");
+        Assert.True(ruleTriggered);
+        Assert.Equal(0, modifiedBeforeRuleTrigger);
+        _output.WriteLine($"[BENCH-01A-RULE-ONLY] Scenario=CanaryFirstInProcessRuleReaction, TotalDocs={totalDocs}, ModifiedBeforeRuleTrigger={modifiedBeforeRuleTrigger}, RuleReactionMs={sw.ElapsedMilliseconds}");
+    }
 
-        // Restore any modified documents from RecoveryVault and verify 100% SHA-256 match
-        var snapshots = vault.ListSnapshots().ToDictionary(s => s.OriginalPath, StringComparer.OrdinalIgnoreCase);
-        int intactOrRecovered = 0;
-        foreach (var kvp in originalHashes)
+    [Fact]
+    public async Task Benchmark_01B_RealSeparateProcessRansomware_BeforeAndAfterProtectionComparison()
+    {
+        // Real A/B comparison using an external separate OS child process (powershell.exe) mutating ONLY
+        // isolated temp documents in the EXACT same deterministic order (doc_00.txt .. doc_19.txt, NO canary first!):
+        //   Run A: Unprotected (AegisSentinel OFF) — measures actual damaged docs on disk
+        //   Run B: Protected (live SecurityOrchestrator + FileSystemWatcher + Restart Manager + real Win32 NtSuspendProcess + RecoveryVault)
+        const int totalDocs = 20;
+        var unprotectedDir = Path.Combine(_tempRoot, "AB_UnprotectedDocs");
+        var protectedDir = Path.Combine(_tempRoot, "AB_ProtectedDocs");
+        var orchestratorDataDir = Path.Combine(_tempRoot, "AB_OrchData");
+        Directory.CreateDirectory(unprotectedDir);
+        Directory.CreateDirectory(protectedDir);
+        Directory.CreateDirectory(orchestratorDataDir);
+
+        static Dictionary<string, string> CreateTestDocs(string dir, int count)
         {
-            var currentHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
-            if (!currentHash.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
+            var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < count; i++)
             {
-                Assert.True(vault.RestoreSnapshot(snapshots[kvp.Key].Id));
-                currentHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                var path = Path.Combine(dir, $"doc_{i:D2}.txt");
+                var text = $"AegisSentinel A/B Benchmark Document #{i:D2}\n" +
+                           string.Join("\n", Enumerable.Repeat($"Original clean user contract paragraph {i}.", 30));
+                File.WriteAllText(path, text, Encoding.UTF8);
+                hashes[path] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
             }
-            if (currentHash.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
+            return hashes;
+        }
+
+        static int CountModifiedDocs(Dictionary<string, string> originalHashes)
+        {
+            int modified = 0;
+            foreach (var kvp in originalHashes)
             {
-                intactOrRecovered++;
+                var current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                if (!current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
+                {
+                    modified++;
+                }
+            }
+            return modified;
+        }
+
+        // Tiny isolated mutator script: touches ONLY doc_*.txt inside the passed temp directory in exact order,
+        // holding each handle ~180 ms while encrypting so standard-mode Restart Manager attributes the live child PID.
+        var scriptPath = Path.Combine(_tempRoot, "safe_temp_mutator.ps1");
+        File.WriteAllText(scriptPath, """
+            param([string]$TargetDir)
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $buf = New-Object byte[] 8192
+            $files = Get-ChildItem -Path $TargetDir -Filter 'doc_*.txt' | Sort-Object Name
+            foreach ($f in $files) {
+                $rng.GetBytes($buf)
+                $fs = [System.IO.File]::Open($f.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+                try {
+                    $fs.SetLength(0)
+                    $fs.Write($buf, 0, $buf.Length)
+                    $fs.Flush()
+                    Start-Sleep -Milliseconds 180
+                } finally {
+                    $fs.Dispose()
+                }
+            }
+            """, Encoding.UTF8);
+
+        var powershellExe = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            @"WindowsPowerShell\v1.0\powershell.exe");
+        Assert.True(File.Exists(powershellExe));
+
+        ProcessStartInfo BuildMutatorPsi(string dir) => new(powershellExe, $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{scriptPath}\" -TargetDir \"{dir}\"")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        // --- Run A: Unprotected Baseline (actual separate OS process runs to completion) ---
+        var unprotectedHashes = CreateTestDocs(unprotectedDir, totalDocs);
+        var swUnprotected = Stopwatch.StartNew();
+        using (var procA = Process.Start(BuildMutatorPsi(unprotectedDir))!)
+        {
+            Assert.True(procA.WaitForExit(15000), "Unprotected baseline mutator timed out!");
+        }
+        swUnprotected.Stop();
+        int unprotectedModified = CountModifiedDocs(unprotectedHashes);
+        Assert.Equal(totalDocs, unprotectedModified);
+
+        // --- Run B: Live AegisSentinel Protection (real FileSystemWatcher + Restart Manager + Win32 NtSuspendProcess + RecoveryVault) ---
+        var protectedHashes = CreateTestDocs(protectedDir, totalDocs);
+        var store = new PolicyStore(orchestratorDataDir);
+        var policy = GuardPolicy.CreateDefault();
+        policy.Mode = ProtectionMode.Balanced;
+        policy.EnableEtwTelemetry = false; // Standard-user safe live path (FSW + Restart Manager + real Win32 NtSuspendProcess)
+        policy.DeployCanaryFiles = false;  // Disable canary-first shortcut so we measure pure behavioral burst freeze!
+        policy.ProtectedFolders = new List<string> { protectedDir };
+        policy.RapidWriteThresholdPer3Sec = 5;
+        store.Save(policy);
+
+        using var orchestrator = new SecurityOrchestrator(store);
+        var frozenTcs = new TaskCompletionSource<SecurityEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        orchestrator.EventRecorded += evt =>
+        {
+            if (evt.Category == ThreatCategory.Ransomware && evt.IsProcessSuspended)
+            {
+                frozenTcs.TrySetResult(evt);
+            }
+        };
+
+        orchestrator.Start();
+        orchestrator.Vault.SnapshotProtectedFolders(policy.ProtectedFolders);
+        Assert.Equal(totalDocs, orchestrator.Vault.ListSnapshots().Count(s => s.OriginalPath.StartsWith(protectedDir, StringComparison.OrdinalIgnoreCase)));
+
+        Process? procB = null;
+        int protectedModifiedBeforeFreeze;
+        long freezeElapsedMs;
+        int recoveredSha256Match = 0;
+
+        try
+        {
+            var swProtected = Stopwatch.StartNew();
+            procB = Process.Start(BuildMutatorPsi(protectedDir))!;
+
+            // Wait for REAL OS NtSuspendProcess freeze of the live separate child process!
+            var freezeEvt = await frozenTcs.Task.WaitAsync(TimeSpan.FromSeconds(12));
+            swProtected.Stop();
+            freezeElapsedMs = swProtected.ElapsedMilliseconds;
+
+            Assert.Equal(procB.Id, freezeEvt.ProcessId);
+            Assert.True(orchestrator.ProcessControl.IsProcessSuspendedByUs(procB.Id), "Live child process must be genuinely frozen by Win32 NtSuspendProcess!");
+
+            // Confirm frozen process stopped mutating files (wait 450 ms > 2 write intervals)
+            await Task.Delay(450);
+            Assert.False(procB.HasExited, "Frozen child process should still be suspended in memory, not exited!");
+
+            // Kill frozen mutator before measuring final protected state and restoring from RecoveryVault
+            try { procB.Kill(entireProcessTree: true); procB.WaitForExit(3000); } catch { }
+            orchestrator.Stop();
+
+            protectedModifiedBeforeFreeze = CountModifiedDocs(protectedHashes);
+            Assert.True(protectedModifiedBeforeFreeze < unprotectedModified,
+                $"Expected live freeze to reduce damaged docs below unprotected baseline ({unprotectedModified}), got {protectedModifiedBeforeFreeze}!");
+
+            // Restore every modified document from RecoveryVault and verify exact SHA-256 match
+            var snapshots = orchestrator.Vault.ListSnapshots().ToDictionary(s => s.OriginalPath, StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in protectedHashes)
+            {
+                var current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                if (!current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
+                {
+                    Assert.True(orchestrator.Vault.RestoreSnapshot(snapshots[kvp.Key].Id));
+                    current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                }
+                if (current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
+                {
+                    recoveredSha256Match++;
+                }
+            }
+        }
+        finally
+        {
+            orchestrator.ProcessControl.ResumeAllSuspendedProcesses();
+            orchestrator.Stop();
+            if (procB is not null)
+            {
+                try { if (!procB.HasExited) procB.Kill(entireProcessTree: true); procB.WaitForExit(2000); } catch { }
+                procB.Dispose();
             }
         }
 
-        canaryMgr.RemoveCanaries();
-
-        Assert.Equal(totalDocs, intactOrRecovered);
-        _output.WriteLine($"[BENCH-01] TotalDocs={totalDocs}, BaselineUnprotectedDamaged={totalDocs}, ModifiedBeforeFreeze={modifiedBeforeFreeze}, RecoveredSha256Match={intactOrRecovered}/{totalDocs} (100%), DetectionLatencyMs={sw.ElapsedMilliseconds}");
+        Assert.Equal(totalDocs, recoveredSha256Match);
+        _output.WriteLine(
+            $"[BENCH-01B-REAL-PROC-AB] TotalDocs={totalDocs}, " +
+            $"UnprotectedRunModified={unprotectedModified}/{totalDocs} ({swUnprotected.ElapsedMilliseconds}ms), " +
+            $"ProtectedLiveFreezeModified={protectedModifiedBeforeFreeze}/{totalDocs} (FreezeAt={freezeElapsedMs}ms), " +
+            $"SavedUnmodifiedBeforeFreeze={unprotectedModified - protectedModifiedBeforeFreeze}, " +
+            $"RecoveredSha256Match={recoveredSha256Match}/{totalDocs} (100%)");
     }
 
     [Fact]
@@ -150,7 +292,6 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
         var now = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
 
-        // 250 Dev workflow ops + 250 Browser/Game ops + 250 Updater ops + 250 File-copy/Backup ops = 1,000 benign ops
         for (int i = 0; i < 250; i++)
         {
             var devEvt = procEval.Evaluate(new ProcessEvaluationContext
@@ -188,15 +329,15 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
 
         Assert.Equal(0, falseFreezes);
         Assert.Equal(0, falseAlerts);
-        Assert.True(sw.ElapsedMilliseconds < 5000, $"Expected 1,000 benign checks < 5s, took {sw.ElapsedMilliseconds}ms");
+        Assert.True(sw.ElapsedMilliseconds < 5000);
         _output.WriteLine($"[BENCH-02] BenignOps=1000, FalseFreezes={falseFreezes}, FalseAlerts={falseAlerts}, TotalMs={sw.ElapsedMilliseconds}, AvgLatencyUs={usPerOp:F2}");
     }
 
     [Fact]
-    public void Benchmark_03_FaultResilienceMatrix_ZeroUserDataLossAcrossSixInjectedFaults()
+    public void Benchmark_03_FaultResilienceMatrix_ZeroUserDataLossAcrossSevenInjectedFaults()
     {
         int passedFaultScenarios = 0;
-        const int totalFaultScenarios = 6;
+        const int totalFaultScenarios = 7;
 
         // Fault 1: Disk-full metadata write failure -> original preserved untouched
         {
@@ -301,6 +442,31 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
             var e = qm.QuarantineFile(f, "F6");
             Assert.Equal(QuarantineRestoreStatus.Restored, qm.RestoreFileDetailed(e.Id).Status);
             Assert.Equal(expected, File.ReadAllBytes(f));
+            passedFaultScenarios++;
+        }
+
+        // Fault 7: Original replaced with newer version right after copy saved -> new file preserved untouched
+        {
+            var d = Path.Combine(_tempRoot, "f7");
+            Directory.CreateDirectory(d);
+            var f = Path.Combine(d, "g.exe");
+            File.WriteAllBytes(f, Encoding.UTF8.GetBytes("FAULT-7-OLD"));
+            var newer = Encoding.UTF8.GetBytes("FAULT-7-NEW-REPLACED");
+            bool swapped = false;
+            var qm = new QuarantineManager(d, writeMetadataOverride: (p, j) =>
+            {
+                File.WriteAllText(p, j);
+                if (!swapped)
+                {
+                    swapped = true;
+                    var tmp = Path.Combine(d, "swap.tmp");
+                    File.WriteAllBytes(tmp, newer);
+                    File.Replace(tmp, f, null, true);
+                }
+            });
+            var e = qm.QuarantineFile(f, "F7");
+            Assert.Equal(QuarantineDisposition.OriginalChangedNotRemoved, e.Disposition);
+            Assert.Equal(newer, File.ReadAllBytes(f));
             passedFaultScenarios++;
         }
 

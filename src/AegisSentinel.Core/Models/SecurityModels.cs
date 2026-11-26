@@ -54,7 +54,8 @@ public enum QuarantineDisposition
     RemovedImmediately = 0,
     ScheduledDeleteOnReboot = 1,
     CopyOnlyOriginalLocked = 2,
-    PendingOriginalRemoval = 3
+    PendingOriginalRemoval = 3,
+    OriginalChangedNotRemoved = 4
 }
 
 public enum QuarantineRestoreStatus

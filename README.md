@@ -7,7 +7,7 @@
 [![.NET 10](https://img.shields.io/badge/.NET-10.0--windows-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
 [![운영체제](https://img.shields.io/badge/운영체제-Windows%2010%2F11%20(x64)-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-40개%20기법%20%7C%2011개%20전술-E11D48)](docs/MITRE_ATTACK_COVERAGE.md)
-[![테스트](https://img.shields.io/badge/자동화%20테스트-62%2F62%20통과-22C55E)](tests/AegisSentinel.Tests/QuarantineChunkedAeadRegressionTests.cs)
+[![테스트](https://img.shields.io/badge/자동화%20테스트-66%2F66%20통과-22C55E)](tests/AegisSentinel.Tests/QuarantineChunkedAeadRegressionTests.cs)
 [![라이선스: MIT](https://img.shields.io/badge/라이선스-MIT-F59E0B.svg)](LICENSE)
 
 > **프로젝트 문서**: [변경 이력 (CHANGELOG)](CHANGELOG.md) · [정량 벤치마크 (BENCHMARKS)](docs/BENCHMARKS.md) · [보안 정책 (SECURITY)](SECURITY.md) · [기여 가이드 (CONTRIBUTING)](CONTRIBUTING.md) · [아키텍처](docs/ARCHITECTURE.md) · [위협 모델](docs/THREAT_MODEL.md)
@@ -152,7 +152,7 @@ flowchart TB
 
 ### 최종 검증 결과
 - **Release 클린 빌드 (`-warnaserror --no-incremental`)**: **경고 0개 · 오류 0개**
-- **자동화 테스트 & 레드팀 시뮬레이션**: **62 / 62 전체 통과** (`AEGISQ3` 청크 AES-256-GCM·크기 증가 자동 전환·랜섬웨어/정상작업/장애내구성 벤치마크 6종·실패 경로 회귀 7종·실제 Win32/OS잠금/WPF STA 검증·실 PC 무제한 MZK 심층 스캔 포함 — 상세 수치: [docs/BENCHMARKS.md](docs/BENCHMARKS.md))
+- **자동화 테스트 & 레드팀 시뮬레이션**: **66 / 66 전체 통과** (격리 TOCTOU 단일 핸들 삭제·사전 전체 청크 검증·별도 OS 프로세스 A/B 랜섬웨어 실측(`20/20 → 3/20`, 복구 `20/20`)·`AEGISQ3` 청크 AES-256-GCM·실패 경로 회귀·실제 Win32/OS잠금/WPF STA 검증·실 PC 무제한 MZK 심층 스캔 포함 — 상세 수치: [docs/BENCHMARKS.md](docs/BENCHMARKS.md))
 - **Windows Defender 정밀 스캔 (`MpCmdRun.exe`)**: **`found no threats`** (오탐 0건)
 - **테스트 임시 폴더 누수**: **`0건`**
 
@@ -171,7 +171,7 @@ flowchart TB
 # 1. 클린 Release 빌드 (모든 경고를 오류로 엄격 검사)
 dotnet build AegisSentinel.slnx -c Release -warnaserror
 
-# 2. 전체 62개 단위 · 레드팀 시뮬레이션 · 정량 벤치마크 · 실환경 감사 테스트 실행
+# 2. 전체 66개 단위 · 레드팀 시뮬레이션 · 정량 벤치마크 · 실환경 감사 테스트 실행
 dotnet test tests/AegisSentinel.Tests/AegisSentinel.Tests.csproj -c Release --no-build --verbosity normal
 
 # 3. WPF 통합 보안 센터 실행
@@ -208,7 +208,7 @@ AegisSentinel/
 │   │   └── Native/                 # Win32 P/Invoke (GetProcessTimes, NtSuspendProcess, WinTrust/Catalog, FlushFileBuffers 등)
 │   └── AegisSentinel.App/          # WPF 다크모드 통합 대시보드 · 트레이 상주 · 단일 FIFO 경고창
 └── tests/
-    └── AegisSentinel.Tests/        # 62개 단위 · 레드팀 · AEGISQ3 · 정량 벤치마크 · 실Win32 · WPF STA 회귀 테스트
+    └── AegisSentinel.Tests/        # 66개 단위 · 레드팀 · TOCTOU/AEGISQ3 · A/B 정량 벤치마크 · 실Win32 · WPF STA 테스트
 ```
 
 ---

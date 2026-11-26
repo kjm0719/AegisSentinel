@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 using AegisSentinel.Core.Models;
 
 namespace AegisSentinel.Core.Services;
@@ -40,6 +42,7 @@ public sealed class QuarantineManager
     private readonly Action<string, string>? _writeMetadataOverride;
     private readonly Action<string, byte[]>? _writeRestoreTempOverride;
     private readonly Action? _onAfterFirstReadChunkForTest;
+    private readonly Action<string>? _onAfterArtifactWrittenBeforeVerifyForTest;
     private readonly long _maxInMemoryGcmBytes;
     private readonly int _chunkedGcmChunkSize;
     private byte[]? _cachedAesKey;
@@ -56,7 +59,8 @@ public sealed class QuarantineManager
         Func<string, bool>? cancelRebootDeleteOverride = null,
         Func<string, bool>? isRebootDeleteScheduledOverride = null,
         int chunkedGcmChunkSize = DefaultChunkedGcmChunkSize,
-        Action? onAfterFirstReadChunkForTest = null)
+        Action? onAfterFirstReadChunkForTest = null,
+        Action<string>? onAfterArtifactWrittenBeforeVerifyForTest = null)
     {
         var root = baseDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -71,6 +75,7 @@ public sealed class QuarantineManager
         _writeMetadataOverride = writeMetadataOverride;
         _writeRestoreTempOverride = writeRestoreTempOverride;
         _onAfterFirstReadChunkForTest = onAfterFirstReadChunkForTest;
+        _onAfterArtifactWrittenBeforeVerifyForTest = onAfterArtifactWrittenBeforeVerifyForTest;
         _maxInMemoryGcmBytes = Math.Clamp(maxInMemoryGcmBytes, 0, MaxInMemoryGcmBytes);
         _chunkedGcmChunkSize = Math.Clamp(chunkedGcmChunkSize, 1024, MaxChunkedGcmChunkSize);
     }
@@ -144,11 +149,17 @@ public sealed class QuarantineManager
         long fileSize;
         string sha256;
         string encryptionFormat;
+        FileHandleIdentity? sourceIdentity = null;
 
         try
         {
             using (var input = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
+                if (TryGetFileHandleIdentity(input.SafeFileHandle.DangerousGetHandle(), out var capturedIdentity, out _))
+                {
+                    sourceIdentity = capturedIdentity;
+                }
+
                 if (initialSize <= effectiveInMemoryLimit && effectiveInMemoryLimit > 0)
                 {
                     // Single-pass bounded read: if another process appends to the file mid-read so it crosses
@@ -217,11 +228,21 @@ public sealed class QuarantineManager
                 }
             }
 
-            // Pre-delete restorability verification: ensure the written quarantine artifact adheres to a
-            // valid, restorable format before committing metadata or touching the original file.
-            if (!IsQuarantineArtifactRestorable(qFilePath, effectiveInMemoryLimit))
+            _onAfterArtifactWrittenBeforeVerifyForTest?.Invoke(qFilePath);
+
+            // P2 Pre-delete full cryptographic streaming verification:
+            // Uses the EXACT SAME decryption + chunk-tag + final-chunk-boundary + SHA-256 verifier as RestoreFileDetailed
+            // (streaming plaintext to Stream.Null with zero extra disk writes) BEFORE committing metadata or deleting original!
+            var verifyStatus = DecryptAndVerifyQuarantineStream(
+                qFilePath,
+                sha256,
+                effectiveInMemoryLimit,
+                plainOutputStream: Stream.Null,
+                allowLegacyXor: false,
+                out var verifyError);
+            if (verifyStatus != QuarantineRestoreStatus.Restored)
             {
-                throw new InvalidOperationException("격리 사본이 복원 가능 형식 검증을 통과하지 못해 원본 파일을 보존하고 중단했습니다.");
+                throw new InvalidOperationException($"격리 사본 사전 복원 검증 실패({verifyError}) — 원본 파일을 보존하고 중단했습니다.");
             }
         }
         catch
@@ -255,19 +276,25 @@ public sealed class QuarantineManager
             throw;
         }
 
-        bool deletedImmediately = _deleteFileOverride is not null
-            ? _deleteFileOverride(originalPath)
-            : TryDeleteWithRetry(originalPath, maxAttempts: 5);
+        // P1 TOCTOU-free original removal:
+        // Verify on a writer-excluding handle that originalPath still points to the EXACT same NTFS File ID
+        // and unmodified SHA-256 bytes we copied into quarantine before deleting via FileDispositionInfo!
+        var removalOutcome = TryRemoveVerifiedOriginal(originalPath, sourceIdentity, sha256, fileSize);
 
         QuarantineDisposition disposition;
         string finalReason = reason;
-        if (deletedImmediately)
+        if (removalOutcome == OriginalRemovalOutcome.Removed)
         {
             disposition = QuarantineDisposition.RemovedImmediately;
         }
+        else if (removalOutcome == OriginalRemovalOutcome.ChangedOrReplacedPreserved)
+        {
+            disposition = QuarantineDisposition.OriginalChangedNotRemoved;
+            finalReason = $"{reason} [격리 중 원본 파일이 변경/교체되어 새 파일을 보존하고 사본만 보관됨]";
+        }
         else
         {
-            // Schedule automatic OS kernel deletion on next reboot before any user process starts
+            // File is genuinely locked AND verified unchanged -> schedule automatic OS kernel deletion on next reboot
             bool scheduled = _scheduleRebootDeleteOverride is not null
                 ? _scheduleRebootDeleteOverride(originalPath)
                 : Native.NativeMethods.MoveFileEx(originalPath, null, Native.NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -436,37 +463,450 @@ public sealed class QuarantineManager
         BinaryPrimitives.WriteUInt32LittleEndian(aad.Slice(17, 4), plainLen);
     }
 
-    private static bool IsQuarantineArtifactRestorable(string qFilePath, long maxSingleShotBytes)
+    private readonly record struct FileHandleIdentity(
+        uint VolumeSerialNumber,
+        uint FileIndexHigh,
+        uint FileIndexLow,
+        ulong LastWriteTime,
+        long FileSize)
     {
+        public bool SameFileObject(FileHandleIdentity other) =>
+            VolumeSerialNumber == other.VolumeSerialNumber &&
+            FileIndexHigh == other.FileIndexHigh &&
+            FileIndexLow == other.FileIndexLow;
+    }
+
+    private enum OriginalRemovalOutcome
+    {
+        Removed,
+        LockedNeedRebootSchedule,
+        ChangedOrReplacedPreserved
+    }
+
+    private static bool TryGetFileHandleIdentity(IntPtr handle, out FileHandleIdentity identity, out uint fileAttributes)
+    {
+        if (Native.NativeMethods.GetFileInformationByHandle(handle, out var info))
+        {
+            long size = ((long)info.FileSizeHigh << 32) | info.FileSizeLow;
+            ulong lastWriteTime = ((ulong)info.LastWriteTimeHigh << 32) | info.LastWriteTimeLow;
+            identity = new FileHandleIdentity(
+                info.VolumeSerialNumber,
+                info.FileIndexHigh,
+                info.FileIndexLow,
+                lastWriteTime,
+                size);
+            fileAttributes = info.FileAttributes;
+            return true;
+        }
+
+        identity = default;
+        fileAttributes = 0;
+        return false;
+    }
+
+    private enum SnapshotMatchStatus
+    {
+        Matched,
+        NotFound,
+        ChangedOrReplaced,
+        Inaccessible
+    }
+
+    private static SnapshotMatchStatus VerifyCurrentPathMatchesSnapshot(
+        string originalPath,
+        FileHandleIdentity? expectedIdentity,
+        string expectedSha256,
+        long expectedSize)
+    {
+        var rawHandle = Native.NativeMethods.CreateFileW(
+            originalPath,
+            Native.NativeMethods.GENERIC_READ,
+            Native.NativeMethods.FILE_SHARE_READ | Native.NativeMethods.FILE_SHARE_WRITE | Native.NativeMethods.FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            Native.NativeMethods.OPEN_EXISTING,
+            Native.NativeMethods.FILE_ATTRIBUTE_NORMAL | Native.NativeMethods.FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        int openErr = Marshal.GetLastWin32Error();
+        if (rawHandle == IntPtr.Zero || rawHandle == new IntPtr(-1))
+        {
+            return openErr is Native.NativeMethods.ERROR_FILE_NOT_FOUND or Native.NativeMethods.ERROR_PATH_NOT_FOUND
+                ? SnapshotMatchStatus.NotFound
+                : SnapshotMatchStatus.Inaccessible;
+        }
+
+        using var safeHandle = new SafeFileHandle(rawHandle, ownsHandle: true);
+        if (!TryGetFileHandleIdentity(safeHandle.DangerousGetHandle(), out var liveIdentity, out uint liveAttrs))
+        {
+            return SnapshotMatchStatus.Inaccessible;
+        }
+        if ((liveAttrs & (uint)FileAttributes.ReparsePoint) != 0)
+        {
+            return SnapshotMatchStatus.ChangedOrReplaced;
+        }
+        if (expectedIdentity is { } exp && !exp.SameFileObject(liveIdentity))
+        {
+            return SnapshotMatchStatus.ChangedOrReplaced;
+        }
+        if (liveIdentity.FileSize != expectedSize)
+        {
+            return SnapshotMatchStatus.ChangedOrReplaced;
+        }
+
         try
         {
-            using var fs = new FileStream(qFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(safeHandle, FileAccess.Read, bufferSize: 65536, isAsync: false);
+            var liveSha = Convert.ToHexString(SHA256.HashData(fs));
+            return liveSha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase)
+                ? SnapshotMatchStatus.Matched
+                : SnapshotMatchStatus.ChangedOrReplaced;
+        }
+        catch
+        {
+            return SnapshotMatchStatus.Inaccessible;
+        }
+    }
+
+    private OriginalRemovalOutcome TryRemoveVerifiedOriginal(
+        string originalPath,
+        FileHandleIdentity? expectedIdentity,
+        string expectedSha256,
+        long expectedSize)
+    {
+        if (_deleteFileOverride is not null)
+        {
+            var preCheck = VerifyCurrentPathMatchesSnapshot(originalPath, expectedIdentity, expectedSha256, expectedSize);
+            if (preCheck == SnapshotMatchStatus.NotFound) return OriginalRemovalOutcome.Removed;
+            if (preCheck == SnapshotMatchStatus.ChangedOrReplaced) return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+            return _deleteFileOverride(originalPath)
+                ? OriginalRemovalOutcome.Removed
+                : OriginalRemovalOutcome.LockedNeedRebootSchedule;
+        }
+
+        const int maxAttempts = 5;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            // Open ONE handle with GENERIC_READ | DELETE and FILE_SHARE_READ ONLY (blocking writers/replacers)
+            // so verification and NTFS FileDispositionInfo deletion act on the EXACT SAME file object!
+            var rawHandle = Native.NativeMethods.CreateFileW(
+                originalPath,
+                Native.NativeMethods.GENERIC_READ | Native.NativeMethods.DELETE_ACCESS,
+                Native.NativeMethods.FILE_SHARE_READ,
+                IntPtr.Zero,
+                Native.NativeMethods.OPEN_EXISTING,
+                Native.NativeMethods.FILE_ATTRIBUTE_NORMAL | Native.NativeMethods.FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero);
+            int openErr = Marshal.GetLastWin32Error();
+
+            if (rawHandle != IntPtr.Zero && rawHandle != new IntPtr(-1))
+            {
+                using var safeHandle = new SafeFileHandle(rawHandle, ownsHandle: true);
+                if (!TryGetFileHandleIdentity(safeHandle.DangerousGetHandle(), out var liveIdentity, out uint liveAttrs))
+                {
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+                if ((liveAttrs & (uint)FileAttributes.ReparsePoint) != 0)
+                {
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+                if (expectedIdentity is { } exp && !exp.SameFileObject(liveIdentity))
+                {
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+                if (liveIdentity.FileSize != expectedSize)
+                {
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+
+                // FileStream takes ownership of safeHandle and closes it on dispose; mark FileDispositionInfo BEFORE dispose.
+                using var verifyStream = new FileStream(safeHandle, FileAccess.Read, bufferSize: 65536, isAsync: false);
+                var liveSha = Convert.ToHexString(SHA256.HashData(verifyStream));
+                if (!liveSha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+
+                var disp = new Native.NativeMethods.FILE_DISPOSITION_INFO { DeleteFile = true };
+                if (Native.NativeMethods.SetFileInformationByHandle(
+                        safeHandle.DangerousGetHandle(),
+                        Native.NativeMethods.FileDispositionInfo,
+                        ref disp,
+                        (uint)Marshal.SizeOf<Native.NativeMethods.FILE_DISPOSITION_INFO>()))
+                {
+                    return OriginalRemovalOutcome.Removed;
+                }
+
+                // ReadOnly attribute can block SetFileInformationByHandle(DeleteFile=true): clear ONLY after verifying match.
+                if ((liveAttrs & (uint)FileAttributes.ReadOnly) != 0)
+                {
+                    try { File.SetAttributes(originalPath, FileAttributes.Normal); } catch { }
+                }
+            }
+            else
+            {
+                if (openErr is Native.NativeMethods.ERROR_FILE_NOT_FOUND or Native.NativeMethods.ERROR_PATH_NOT_FOUND)
+                {
+                    return OriginalRemovalOutcome.Removed;
+                }
+
+                var snapCheck = VerifyCurrentPathMatchesSnapshot(originalPath, expectedIdentity, expectedSha256, expectedSize);
+                if (snapCheck == SnapshotMatchStatus.NotFound)
+                {
+                    return OriginalRemovalOutcome.Removed;
+                }
+                if (snapCheck == SnapshotMatchStatus.ChangedOrReplaced)
+                {
+                    // Never delete or schedule reboot delete for a modified/replaced file!
+                    return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+                }
+
+                if (openErr == Native.NativeMethods.ERROR_ACCESS_DENIED && snapCheck == SnapshotMatchStatus.Matched)
+                {
+                    try
+                    {
+                        var attrs = File.GetAttributes(originalPath);
+                        if ((attrs & FileAttributes.ReparsePoint) == 0 && (attrs & FileAttributes.ReadOnly) != 0)
+                        {
+                            File.SetAttributes(originalPath, FileAttributes.Normal);
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (attempt + 1 < maxAttempts)
+            {
+                Thread.Sleep(50 * (attempt + 1));
+            }
+        }
+
+        // Final check before reporting locked for reboot-delete scheduling: never schedule on a replaced file!
+        var finalCheck = VerifyCurrentPathMatchesSnapshot(originalPath, expectedIdentity, expectedSha256, expectedSize);
+        if (finalCheck == SnapshotMatchStatus.NotFound) return OriginalRemovalOutcome.Removed;
+        if (finalCheck == SnapshotMatchStatus.ChangedOrReplaced) return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
+        return OriginalRemovalOutcome.LockedNeedRebootSchedule;
+    }
+
+    /// <summary>
+    /// Shared cryptographic streaming decrypt + authenticate + SHA-256 verification path used by BOTH
+    /// pre-delete restorability verification (writing to Stream.Null) and RestoreFileDetailed!
+    /// </summary>
+    private QuarantineRestoreStatus DecryptAndVerifyQuarantineStream(
+        string fullQFile,
+        string? expectedSha256,
+        long maxSingleShotBytes,
+        Stream plainOutputStream,
+        bool allowLegacyXor,
+        out string errorMessage)
+    {
+        errorMessage = string.Empty;
+        try
+        {
+            using var input = new FileStream(fullQFile, FileMode.Open, FileAccess.Read, FileShare.Read);
             var header = new byte[8];
-            if (fs.Read(header, 0, header.Length) != 8) return false;
+            if (input.Read(header, 0, header.Length) != 8)
+            {
+                errorMessage = "격리 파일 헤더가 손상되었습니다.";
+                return QuarantineRestoreStatus.IntegrityCheckFailed;
+            }
 
             if (header.SequenceEqual(AesGcmMagicHeader))
             {
-                long minHeader = 8 + GcmNonceSize + GcmTagSize;
-                if (fs.Length < minHeader) return false;
-                long cipherLen = fs.Length - minHeader;
-                return cipherLen >= 0 && cipherLen <= Math.Min(maxSingleShotBytes, MaxInMemoryGcmBytes);
+                var nonce = new byte[GcmNonceSize];
+                var tag = new byte[GcmTagSize];
+                if (!ReadExact(input, nonce, nonce.Length) || !ReadExact(input, tag, tag.Length))
+                {
+                    errorMessage = "AES-GCM 메타데이터가 손상되었습니다.";
+                    return QuarantineRestoreStatus.IntegrityCheckFailed;
+                }
+
+                long rawCipherLen = input.Length - input.Position;
+                if (rawCipherLen < 0 || rawCipherLen > Math.Min(maxSingleShotBytes, MaxInMemoryGcmBytes))
+                {
+                    errorMessage = "격리 파일 크기가 단일 AES-GCM 복원 상한을 초과했거나 비정상적입니다.";
+                    return QuarantineRestoreStatus.IntegrityCheckFailed;
+                }
+
+                int cipherLen = (int)rawCipherLen;
+                var cipher = new byte[cipherLen];
+                if (cipherLen > 0 && !ReadExact(input, cipher, cipherLen))
+                {
+                    errorMessage = "격리 파일 본문을 끝까지 읽지 못했습니다.";
+                    return QuarantineRestoreStatus.IntegrityCheckFailed;
+                }
+
+                var plain = new byte[cipherLen];
+                try
+                {
+                    using (var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize))
+                    {
+                        aes.Decrypt(nonce, cipher, tag, plain, AesGcmMagicHeader);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(expectedSha256))
+                    {
+                        var actualSha = Convert.ToHexString(SHA256.HashData(plain));
+                        if (!actualSha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            errorMessage = "복호화 데이터 SHA-256 무결성 검증에 실패했습니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+                    }
+
+                    if (plain.Length > 0)
+                    {
+                        plainOutputStream.Write(plain, 0, plain.Length);
+                    }
+                    return QuarantineRestoreStatus.Restored;
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(plain);
+                }
             }
 
             if (header.SequenceEqual(ChunkedAesGcmMagicHeader))
             {
-                if (fs.Length < 8 + GcmNonceSize + 4 + 5 + GcmTagSize) return false;
-                fs.Seek(8 + GcmNonceSize, SeekOrigin.Begin);
+                var baseNonce = new byte[GcmNonceSize];
                 var sizeBuf = new byte[4];
-                if (fs.Read(sizeBuf, 0, 4) != 4) return false;
-                uint chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(sizeBuf);
-                return chunkSize >= 1 && chunkSize <= MaxChunkedGcmChunkSize;
+                if (!ReadExact(input, baseNonce, GcmNonceSize) || !ReadExact(input, sizeBuf, 4))
+                {
+                    errorMessage = "청크 AES-GCM 헤더가 손상되었습니다.";
+                    return QuarantineRestoreStatus.IntegrityCheckFailed;
+                }
+
+                uint chunkSizeU32 = BinaryPrimitives.ReadUInt32LittleEndian(sizeBuf);
+                if (chunkSizeU32 < 1 || chunkSizeU32 > MaxChunkedGcmChunkSize)
+                {
+                    errorMessage = "청크 AES-GCM 블록 크기가 허용 범위를 벗어났습니다.";
+                    return QuarantineRestoreStatus.IntegrityCheckFailed;
+                }
+
+                int chunkSize = (int)chunkSizeU32;
+                var frameHeader = new byte[5];
+                var tag = new byte[GcmTagSize];
+                var cipherBuf = new byte[chunkSize];
+                var plainBuf = new byte[chunkSize];
+                var chunkNonce = new byte[GcmNonceSize];
+                var aad = new byte[21];
+
+                using var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize);
+                using var incHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+                try
+                {
+                    ulong chunkIndex = 0;
+                    bool sawFinalChunk = false;
+
+                    while (true)
+                    {
+                        if (!ReadExact(input, frameHeader, frameHeader.Length))
+                        {
+                            errorMessage = "청크 AES-GCM 스트림이 최종 청크 이전에 절단되었습니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+
+                        byte flags = frameHeader[0];
+                        if (flags != ChunkFlagIntermediate && flags != ChunkFlagFinal)
+                        {
+                            errorMessage = "청크 AES-GCM 플래그가 손상되었습니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+
+                        uint plainLenU32 = BinaryPrimitives.ReadUInt32LittleEndian(frameHeader.AsSpan(1, 4));
+                        if (plainLenU32 > chunkSizeU32)
+                        {
+                            errorMessage = "청크 AES-GCM 청크 길이가 비정상적입니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+
+                        int plainLen = (int)plainLenU32;
+                        if (!ReadExact(input, tag, GcmTagSize) ||
+                            (plainLen > 0 && !ReadExact(input, cipherBuf, plainLen)))
+                        {
+                            errorMessage = "청크 AES-GCM 데이터가 불완전합니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+
+                        DeriveChunkNonce(baseNonce, chunkIndex, chunkNonce);
+                        BuildChunkAad(chunkIndex, flags, plainLenU32, aad);
+                        aes.Decrypt(chunkNonce, cipherBuf.AsSpan(0, plainLen), tag, plainBuf.AsSpan(0, plainLen), aad);
+
+                        if (plainLen > 0)
+                        {
+                            incHash.AppendData(plainBuf, 0, plainLen);
+                            plainOutputStream.Write(plainBuf, 0, plainLen);
+                        }
+
+                        if (flags == ChunkFlagFinal)
+                        {
+                            sawFinalChunk = true;
+                            break;
+                        }
+
+                        chunkIndex++;
+                    }
+
+                    if (!sawFinalChunk || input.Position != input.Length)
+                    {
+                        errorMessage = "청크 AES-GCM 스트림 종료 경계 검증에 실패했습니다.";
+                        return QuarantineRestoreStatus.IntegrityCheckFailed;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(expectedSha256))
+                    {
+                        var actualSha = Convert.ToHexString(incHash.GetHashAndReset());
+                        if (!actualSha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            errorMessage = "청크 복호화 데이터 SHA-256 무결성 검증에 실패했습니다.";
+                            return QuarantineRestoreStatus.IntegrityCheckFailed;
+                        }
+                    }
+
+                    return QuarantineRestoreStatus.Restored;
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(plainBuf);
+                }
             }
 
-            return false;
+            if (allowLegacyXor && header.SequenceEqual(LegacyMagicHeader))
+            {
+                using var incHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                var buffer = new byte[65536];
+                int bytesRead;
+                long offset = 0;
+                while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    for (int i = 0; i < bytesRead; i++)
+                    {
+                        buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
+                    }
+                    incHash.AppendData(buffer, 0, bytesRead);
+                    plainOutputStream.Write(buffer, 0, bytesRead);
+                    offset += bytesRead;
+                }
+
+                if (!string.IsNullOrWhiteSpace(expectedSha256))
+                {
+                    var actualSha = Convert.ToHexString(incHash.GetHashAndReset());
+                    if (!actualSha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        errorMessage = "레거시 격리 데이터 SHA-256 무결성 검증에 실패했습니다.";
+                        return QuarantineRestoreStatus.IntegrityCheckFailed;
+                    }
+                }
+
+                return QuarantineRestoreStatus.Restored;
+            }
+
+            errorMessage = "지원되지 않는 격리 파일 형식입니다.";
+            return QuarantineRestoreStatus.IntegrityCheckFailed;
         }
-        catch
+        catch (CryptographicException ex)
         {
-            return false;
+            errorMessage = $"복호화/무결성 검증 실패: {ex.Message}";
+            return QuarantineRestoreStatus.IntegrityCheckFailed;
         }
     }
 
@@ -621,224 +1061,41 @@ public sealed class QuarantineManager
 
             try
             {
-                using (var input = new FileStream(fullQFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+                QuarantineRestoreStatus decryptStatus;
+                string decryptError;
+                if (_writeRestoreTempOverride is not null)
                 {
-                    var header = new byte[8];
-                    int readHeader = input.Read(header, 0, header.Length);
-                    if (readHeader != 8)
+                    using var ms = new MemoryStream();
+                    decryptStatus = DecryptAndVerifyQuarantineStream(
+                        fullQFile,
+                        entry.Sha256,
+                        Math.Min(_maxInMemoryGcmBytes, MaxInMemoryGcmBytes),
+                        ms,
+                        allowLegacyXor: true,
+                        out decryptError);
+                    if (decryptStatus != QuarantineRestoreStatus.Restored)
                     {
-                        return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 헤더가 손상되었습니다.");
+                        return new QuarantineRestoreResult(decryptStatus, destination, decryptError);
                     }
-
-                    if (header.SequenceEqual(AesGcmMagicHeader))
+                    var decrypted = ms.ToArray();
+                    try { WriteRestoreTempFile(tmpDest, decrypted); }
+                    finally { CryptographicOperations.ZeroMemory(decrypted); }
+                }
+                else
+                {
+                    using var output = new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                    decryptStatus = DecryptAndVerifyQuarantineStream(
+                        fullQFile,
+                        entry.Sha256,
+                        Math.Min(_maxInMemoryGcmBytes, MaxInMemoryGcmBytes),
+                        output,
+                        allowLegacyXor: true,
+                        out decryptError);
+                    if (decryptStatus != QuarantineRestoreStatus.Restored)
                     {
-                        var nonce = new byte[GcmNonceSize];
-                        var tag = new byte[GcmTagSize];
-                        if (input.Read(nonce, 0, nonce.Length) != nonce.Length ||
-                            input.Read(tag, 0, tag.Length) != tag.Length)
-                        {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "AES-GCM 메타데이터가 손상되었습니다.");
-                        }
-
-                        long rawCipherLen = input.Length - input.Position;
-                        if (rawCipherLen < 0 || rawCipherLen > Math.Min(_maxInMemoryGcmBytes, MaxInMemoryGcmBytes))
-                        {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 크기가 단일 AES-GCM 복원 상한을 초과했거나 비정상적입니다.");
-                        }
-
-                        int cipherLen = (int)rawCipherLen;
-                        var cipher = new byte[cipherLen];
-                        int readCipher = 0;
-                        while (readCipher < cipherLen)
-                        {
-                            int r = input.Read(cipher, readCipher, cipherLen - readCipher);
-                            if (r <= 0) break;
-                            readCipher += r;
-                        }
-                        if (readCipher != cipherLen)
-                        {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 본문을 끝까지 읽지 못했습니다.");
-                        }
-
-                        var plain = new byte[cipherLen];
-                        try
-                        {
-                            using (var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize))
-                            {
-                                aes.Decrypt(nonce, cipher, tag, plain, AesGcmMagicHeader);
-                            }
-
-                            if (!string.IsNullOrWhiteSpace(entry.Sha256))
-                            {
-                                var actualSha = Convert.ToHexString(SHA256.HashData(plain));
-                                if (!actualSha.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "복호화 데이터 SHA-256 무결성 검증에 실패했습니다.");
-                                }
-                            }
-
-                            WriteRestoreTempFile(tmpDest, plain);
-                        }
-                        finally
-                        {
-                            CryptographicOperations.ZeroMemory(plain);
-                        }
+                        return new QuarantineRestoreResult(decryptStatus, destination, decryptError);
                     }
-                    else if (header.SequenceEqual(ChunkedAesGcmMagicHeader))
-                    {
-                        var baseNonce = new byte[GcmNonceSize];
-                        var sizeBuf = new byte[4];
-                        if (!ReadExact(input, baseNonce, GcmNonceSize) || !ReadExact(input, sizeBuf, 4))
-                        {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 헤더가 손상되었습니다.");
-                        }
-
-                        uint chunkSizeU32 = BinaryPrimitives.ReadUInt32LittleEndian(sizeBuf);
-                        if (chunkSizeU32 < 1 || chunkSizeU32 > MaxChunkedGcmChunkSize)
-                        {
-                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 블록 크기가 허용 범위를 벗어났습니다.");
-                        }
-
-                        int chunkSize = (int)chunkSizeU32;
-                        var frameHeader = new byte[5];
-                        var tag = new byte[GcmTagSize];
-                        var cipherBuf = new byte[chunkSize];
-                        var plainBuf = new byte[chunkSize];
-                        var chunkNonce = new byte[GcmNonceSize];
-                        var aad = new byte[21];
-
-                        using var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize);
-                        using var overrideBuffer = _writeRestoreTempOverride is not null ? new MemoryStream() : null;
-                        using var output = _writeRestoreTempOverride is null
-                            ? new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None)
-                            : null;
-
-                        try
-                        {
-                            ulong chunkIndex = 0;
-                            bool sawFinalChunk = false;
-
-                            while (true)
-                            {
-                                if (!ReadExact(input, frameHeader, frameHeader.Length))
-                                {
-                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 스트림이 최종 청크 이전에 절단되었습니다.");
-                                }
-
-                                byte flags = frameHeader[0];
-                                if (flags != ChunkFlagIntermediate && flags != ChunkFlagFinal)
-                                {
-                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 플래그가 손상되었습니다.");
-                                }
-
-                                uint plainLenU32 = BinaryPrimitives.ReadUInt32LittleEndian(frameHeader.AsSpan(1, 4));
-                                if (plainLenU32 > chunkSizeU32)
-                                {
-                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 청크 길이가 비정상적입니다.");
-                                }
-
-                                int plainLen = (int)plainLenU32;
-                                if (!ReadExact(input, tag, GcmTagSize) ||
-                                    (plainLen > 0 && !ReadExact(input, cipherBuf, plainLen)))
-                                {
-                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 데이터가 불완전합니다.");
-                                }
-
-                                DeriveChunkNonce(baseNonce, chunkIndex, chunkNonce);
-                                BuildChunkAad(chunkIndex, flags, plainLenU32, aad);
-                                aes.Decrypt(chunkNonce, cipherBuf.AsSpan(0, plainLen), tag, plainBuf.AsSpan(0, plainLen), aad);
-
-                                if (plainLen > 0)
-                                {
-                                    if (overrideBuffer is not null)
-                                    {
-                                        overrideBuffer.Write(plainBuf, 0, plainLen);
-                                    }
-                                    else
-                                    {
-                                        output!.Write(plainBuf, 0, plainLen);
-                                    }
-                                }
-
-                                if (flags == ChunkFlagFinal)
-                                {
-                                    sawFinalChunk = true;
-                                    break;
-                                }
-
-                                chunkIndex++;
-                            }
-
-                            if (!sawFinalChunk || input.Position != input.Length)
-                            {
-                                return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "청크 AES-GCM 스트림 종료 경계 검증에 실패했습니다.");
-                            }
-
-                            if (overrideBuffer is not null)
-                            {
-                                var decrypted = overrideBuffer.ToArray();
-                                try { WriteRestoreTempFile(tmpDest, decrypted); }
-                                finally { CryptographicOperations.ZeroMemory(decrypted); }
-                            }
-                            else
-                            {
-                                output!.Flush(flushToDisk: true);
-                            }
-                        }
-                        finally
-                        {
-                            CryptographicOperations.ZeroMemory(plainBuf);
-                        }
-                    }
-                    else if (header.SequenceEqual(LegacyMagicHeader))
-                    {
-                        if (_writeRestoreTempOverride is not null)
-                        {
-                            using var ms = new MemoryStream();
-                            var buffer = new byte[65536];
-                            int bytesRead;
-                            long offset = 0;
-                            while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
-                            {
-                                for (int i = 0; i < bytesRead; i++)
-                                {
-                                    buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
-                                }
-                                ms.Write(buffer, 0, bytesRead);
-                                offset += bytesRead;
-                            }
-                            var decrypted = ms.ToArray();
-                            try
-                            {
-                                WriteRestoreTempFile(tmpDest, decrypted);
-                            }
-                            finally
-                            {
-                                CryptographicOperations.ZeroMemory(decrypted);
-                            }
-                        }
-                        else
-                        {
-                            using var output = new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                            var buffer = new byte[65536];
-                            int bytesRead;
-                            long offset = 0;
-                            while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
-                            {
-                                for (int i = 0; i < bytesRead; i++)
-                                {
-                                    buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
-                                }
-                                output.Write(buffer, 0, bytesRead);
-                                offset += bytesRead;
-                            }
-                            output.Flush(flushToDisk: true);
-                        }
-                    }
-                    else
-                    {
-                        return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "지원되지 않는 격리 파일 형식입니다.");
-                    }
+                    output.Flush(flushToDisk: true);
                 }
 
                 // Re-verify SHA-256 directly on the flushed temp file BEFORE replacing destination.
