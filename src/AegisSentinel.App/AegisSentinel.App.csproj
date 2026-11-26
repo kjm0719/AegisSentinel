@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AegisSentinel.Core\AegisSentinel.Core.csproj" />
+    <InternalsVisibleTo Include="AegisSentinel.Tests" />
   </ItemGroup>
 
   <PropertyGroup>

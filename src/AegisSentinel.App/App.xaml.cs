@@ -14,7 +14,7 @@ public partial class App : System.Windows.Application, IDisposable
 {
     private const int MaxQueuedPrompts = 32;
     private ThreatPromptWindow? _activePrompt;
-    private readonly Queue<SecurityEvent> _promptQueue = new();
+    private ThreatPromptQueueCoordinator? _promptCoordinator;
     private Mutex? _singleInstanceMutex;
     private bool _ownsMutex;
     private bool _cleanedUp;
@@ -60,6 +60,17 @@ public partial class App : System.Windows.Application, IDisposable
         }
 
         _orchestrator = new SecurityOrchestrator();
+        _promptCoordinator = new ThreatPromptQueueCoordinator(
+            MaxQueuedPrompts,
+            showPrompt: ShowSinglePrompt,
+            updateActiveQueuedCount: count => _activePrompt?.UpdateQueuedCount(count),
+            releaseSuspendedEvent: evt =>
+            {
+                if (_orchestrator is not null && evt.HasAnySuspendedProcess)
+                {
+                    try { _orchestrator.AllowAndResumeProcess(evt, addToWhitelist: false, grantSessionImmunity: false); } catch { }
+                }
+            });
         _mainWindow = new MainWindow(_orchestrator);
         MainWindow = _mainWindow;
 
@@ -161,42 +172,9 @@ public partial class App : System.Windows.Application, IDisposable
 
     private void EnqueueOrShowPrompt(SecurityEvent evt)
     {
-        if (_orchestrator is null || _cleanedUp) return;
-
-        bool IsSamePrompt(SecurityEvent a, SecurityEvent b) =>
-            a.ProcessId == b.ProcessId &&
-            a.Category == b.Category &&
-            string.Equals(a.TargetPath, b.TargetPath, StringComparison.OrdinalIgnoreCase);
-
-        // Deduplicate against currently active prompt and queued items
-        if ((_activePrompt is not null && IsSamePrompt(_activePrompt.SecurityEvent, evt)) ||
-            _promptQueue.Any(q => IsSamePrompt(q, evt)))
-        {
-            // Never strand a duplicate suspended event frozen
-            if (evt.IsProcessSuspended && _activePrompt?.SecurityEvent.ProcessId != evt.ProcessId)
-            {
-                _orchestrator.AllowAndResumeProcess(evt, addToWhitelist: false, grantSessionImmunity: false);
-            }
-            return;
-        }
-
-        if (_activePrompt is not null)
-        {
-            if (_promptQueue.Count >= MaxQueuedPrompts)
-            {
-                // Queue saturated: never strand a suspended process frozen forever
-                if (evt.IsProcessSuspended)
-                {
-                    _orchestrator.AllowAndResumeProcess(evt, addToWhitelist: false, grantSessionImmunity: false);
-                }
-                return;
-            }
-            _promptQueue.Enqueue(evt);
-            _activePrompt.UpdateQueuedCount(_promptQueue.Count);
-            return;
-        }
-
-        ShowSinglePrompt(evt);
+        if (_orchestrator is null || _cleanedUp || _promptCoordinator is null) return;
+        _promptCoordinator.EnqueueOrShow(evt);
+        _activePrompt?.RefreshSuspensionDisplay();
     }
 
     private void ShowSinglePrompt(SecurityEvent evt)
@@ -204,7 +182,7 @@ public partial class App : System.Windows.Application, IDisposable
         if (_orchestrator is null || _cleanedUp) return;
         // Keep Owner = null and ShowActivated = False so minimizing MainWindow never hides the alert
         // and the popup never steals keyboard focus mid-typing!
-        var prompt = new ThreatPromptWindow(_orchestrator, evt, _promptQueue.Count);
+        var prompt = new ThreatPromptWindow(_orchestrator, evt, _promptCoordinator?.QueuedCount ?? 0);
         _activePrompt = prompt;
         prompt.Closed += (_, _) =>
         {
@@ -213,10 +191,9 @@ public partial class App : System.Windows.Application, IDisposable
                 _activePrompt = null;
             }
             _mainWindow?.RefreshAfterIntervention();
-            if (!_cleanedUp && _orchestrator is not null && _promptQueue.Count > 0)
+            if (!_cleanedUp && _orchestrator is not null)
             {
-                var next = _promptQueue.Dequeue();
-                ShowSinglePrompt(next);
+                _promptCoordinator?.OnActivePromptClosed(evt);
             }
         };
         prompt.Show();
@@ -224,15 +201,9 @@ public partial class App : System.Windows.Application, IDisposable
 
     private void CloseAllOpenPrompts()
     {
-        // Drain queued events first so no suspended process is left stranded frozen
-        while (_promptQueue.Count > 0)
-        {
-            var pending = _promptQueue.Dequeue();
-            if (pending.IsProcessSuspended && _orchestrator is not null)
-            {
-                try { _orchestrator.AllowAndResumeProcess(pending, addToWhitelist: false, grantSessionImmunity: false); } catch { }
-            }
-        }
+        // Drain queued events first so no suspended root OR child process is left stranded frozen
+        _promptCoordinator?.DrainAllQueued();
+        _promptCoordinator?.ClearActiveWithoutClosing();
 
         var active = _activePrompt;
         _activePrompt = null;

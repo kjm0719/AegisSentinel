@@ -375,22 +375,22 @@ public sealed class SecurityOrchestrator : IDisposable
 
     public bool AllowAndResumeProcess(SecurityEvent evt, bool addToWhitelist, bool grantSessionImmunity = true)
     {
-        if (evt.ProcessId > 4)
+        var result = AllowAndResumeProcessDetailed(evt, addToWhitelist, grantSessionImmunity);
+        return result.AllCleared && result.AnyResumed;
+    }
+
+    public ProcessTreeResumeResult AllowAndResumeProcessDetailed(
+        SecurityEvent evt,
+        bool addToWhitelist,
+        bool grantSessionImmunity = true)
+    {
+        if (evt.ProcessId > 4 && _sessionAllowedPids.Count > 1024)
         {
-            if (_sessionAllowedPids.Count > 1024)
+            var cutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
+            foreach (var kvp in _sessionAllowedPids)
             {
-                var cutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
-                foreach (var kvp in _sessionAllowedPids)
-                {
-                    if (kvp.Value.AllowedAt < cutoff) _sessionAllowedPids.TryRemove(kvp.Key, out _);
-                }
+                if (kvp.Value.AllowedAt < cutoff) _sessionAllowedPids.TryRemove(kvp.Key, out _);
             }
-            if (grantSessionImmunity)
-            {
-                _sessionAllowedPids[evt.ProcessId] = (evt.ProcessPath ?? string.Empty, DateTimeOffset.UtcNow);
-            }
-            _activeInterventionPids.TryRemove(evt.ProcessId, out _);
-            _riskEngine.ClearProcess(evt.ProcessId);
         }
 
         if (addToWhitelist && !string.IsNullOrWhiteSpace(evt.ProcessPath) && !QuarantineManager.IsProtectedSystemOrSelfPath(evt.ProcessPath))
@@ -423,35 +423,121 @@ public sealed class SecurityOrchestrator : IDisposable
             _policyStore.Save(updated);
         }
 
-        // Resume ONLY the root (if suspended) and actually-suspended children recorded on the event or tracked by ProcessController
-        var childPidsToResume = new HashSet<int>(evt.SuspendedChildProcessIds);
+        // Collect suspended child targets from recorded instances, recorded PIDs, and live tracked descendants
+        var fallbackChildPids = new HashSet<int>(evt.SuspendedChildProcessIds);
+        foreach (var inst in evt.SuspendedChildInstances)
+        {
+            if (inst.ProcessId > 4 && inst.ProcessId != evt.ProcessId)
+            {
+                fallbackChildPids.Add(inst.ProcessId);
+            }
+        }
         if (evt.ProcessId > 4)
         {
             foreach (var d in _treeTracker.GetDescendantPids(evt.ProcessId))
             {
                 if (_processController.IsProcessSuspendedByUs(d))
                 {
-                    childPidsToResume.Add(d);
+                    fallbackChildPids.Add(d);
                 }
             }
         }
-        foreach (var childPid in childPidsToResume)
+
+        var resumeResult = _processController.TryResumeProcessTreeDetailed(
+            evt.ProcessId,
+            evt.ProcessCreationTimeFileTimeUtc,
+            evt.SuspendedChildInstances,
+            fallbackChildPids);
+
+        // Update root tracking ONLY when root is cleared (resumed or exited/replaced)
+        if (!resumeResult.RootStillSuspended)
         {
-            var childPath = _processController.GetExecutablePath(childPid);
-            if (grantSessionImmunity && !string.IsNullOrWhiteSpace(childPath))
+            if (evt.ProcessId > 4)
             {
-                _sessionAllowedPids[childPid] = (childPath, DateTimeOffset.UtcNow);
+                if (grantSessionImmunity)
+                {
+                    _sessionAllowedPids[evt.ProcessId] = (evt.ProcessPath ?? string.Empty, DateTimeOffset.UtcNow);
+                }
+                _activeInterventionPids.TryRemove(evt.ProcessId, out _);
+                _riskEngine.ClearProcess(evt.ProcessId);
             }
-            _activeInterventionPids.TryRemove(childPid, out _);
-            _riskEngine.ClearProcess(childPid);
+            evt.IsProcessSuspended = false;
+        }
+        else
+        {
+            evt.IsProcessSuspended = true;
+            if (evt.ProcessId > 4)
+            {
+                _activeInterventionPids[evt.ProcessId] = 1;
+            }
         }
 
-        bool resumed = (evt.ProcessId > 4 || childPidsToResume.Count > 0) &&
-                       _processController.TryResumeProcessTree(evt.ProcessId, childPidsToResume) > 0;
-        evt.IsProcessSuspended = false;
-        evt.SuspendedChildProcessIds.Clear();
-        evt.ActionTaken = SecurityActionTaken.Allowed;
-        return resumed;
+        // Update child tracking ONLY for children that were actually resumed or exited/replaced
+        var remainingChildren = new HashSet<int>(resumeResult.RemainingSuspendedChildPids);
+        foreach (var childRes in resumeResult.ChildResults)
+        {
+            if (childRes.Status != ProcessResumeStatus.TransientFailureRetryRequired)
+            {
+                if (grantSessionImmunity && childRes.Status == ProcessResumeStatus.Resumed)
+                {
+                    var childPath = _processController.GetExecutablePath(childRes.ProcessId);
+                    if (!string.IsNullOrWhiteSpace(childPath))
+                    {
+                        _sessionAllowedPids[childRes.ProcessId] = (childPath, DateTimeOffset.UtcNow);
+                    }
+                }
+                _activeInterventionPids.TryRemove(childRes.ProcessId, out _);
+                _riskEngine.ClearProcess(childRes.ProcessId);
+            }
+            else
+            {
+                _activeInterventionPids[childRes.ProcessId] = 1;
+            }
+        }
+
+        // Clean up any historical child PID that was no longer tracked by ProcessController
+        foreach (var childPid in fallbackChildPids)
+        {
+            if (!remainingChildren.Contains(childPid))
+            {
+                _activeInterventionPids.TryRemove(childPid, out _);
+                _riskEngine.ClearProcess(childPid);
+            }
+        }
+
+        evt.SuspendedChildProcessIds = remainingChildren.OrderBy(p => p).ToList();
+        evt.SuspendedChildInstances = evt.SuspendedChildInstances
+            .Where(inst => remainingChildren.Contains(inst.ProcessId))
+            .ToList();
+
+        if (resumeResult.AllCleared)
+        {
+            evt.ActionTaken = SecurityActionTaken.Allowed;
+            evt.ContainmentDetail = resumeResult.AnyResumed
+                ? "프로세스 및 자식 트리 재개 완료 (허용됨)"
+                : "동결 대상 없음 또는 이미 종료됨 (허용됨)";
+            if (resumeResult.RootStatus is not null || resumeResult.ChildResults.Count > 0)
+            {
+                _auditLog.Append(evt);
+            }
+        }
+        else
+        {
+            var pendingList = new List<int>();
+            if (resumeResult.RootStillSuspended) pendingList.Add(evt.ProcessId);
+            pendingList.AddRange(resumeResult.RemainingSuspendedChildPids);
+            var pendingText = string.Join(", ", pendingList.Distinct());
+
+            evt.ActionTaken = resumeResult.AnyResumed
+                ? SecurityActionTaken.PartiallyAllowed
+                : SecurityActionTaken.Suspended;
+            evt.ContainmentDetail = resumeResult.AnyResumed
+                ? $"부분 재개 완료 · 재시도 필요 PID: [{pendingText}]"
+                : $"재개 실패 (동결 상태 유지) · 재시도 필요 PID: [{pendingText}]";
+            _auditLog.Append(evt);
+        }
+
+        return resumeResult;
     }
 
     public async Task<(bool Success, string Message)> FirewallBlockProcessAsync(SecurityEvent evt)
@@ -460,12 +546,23 @@ public sealed class SecurityOrchestrator : IDisposable
         var result = await FirewallController.BlockOutboundExecutableAsync(path);
         if (result.Success)
         {
-            if (evt.ProcessId > 4)
+            if (evt.ProcessId > 4 || evt.HasAnySuspendedProcess)
             {
-                // Network is now blocked at the OS WFP firewall layer; resume the entire process tree so it doesn't stay frozen in RAM.
-                var descendants = _treeTracker.GetDescendantPids(evt.ProcessId);
+                // Network is now blocked at the OS WFP firewall layer; resume the process tree so it doesn't stay frozen in RAM.
+                var descendants = evt.ProcessId > 4
+                    ? _treeTracker.GetDescendantPids(evt.ProcessId).Concat(evt.SuspendedChildProcessIds).Distinct().ToList()
+                    : evt.SuspendedChildProcessIds.ToList();
+
+                var resumeResult = _processController.TryResumeProcessTreeDetailed(
+                    evt.ProcessId,
+                    evt.ProcessCreationTimeFileTimeUtc,
+                    evt.SuspendedChildInstances,
+                    descendants);
+
+                var remainingChildren = new HashSet<int>(resumeResult.RemainingSuspendedChildPids);
                 foreach (var childPid in descendants)
                 {
+                    if (remainingChildren.Contains(childPid)) continue;
                     var childPath = _processController.GetExecutablePath(childPid);
                     if (!string.IsNullOrWhiteSpace(childPath))
                     {
@@ -475,11 +572,18 @@ public sealed class SecurityOrchestrator : IDisposable
                     _riskEngine.ClearProcess(childPid);
                 }
 
-                _activeInterventionPids.TryRemove(evt.ProcessId, out _);
-                _riskEngine.ClearProcess(evt.ProcessId);
-                _sessionAllowedPids[evt.ProcessId] = (evt.ProcessPath ?? string.Empty, DateTimeOffset.UtcNow);
-                _processController.TryResumeProcessTree(evt.ProcessId, descendants);
-                evt.IsProcessSuspended = false;
+                if (!resumeResult.RootStillSuspended && evt.ProcessId > 4)
+                {
+                    _activeInterventionPids.TryRemove(evt.ProcessId, out _);
+                    _riskEngine.ClearProcess(evt.ProcessId);
+                    _sessionAllowedPids[evt.ProcessId] = (evt.ProcessPath ?? string.Empty, DateTimeOffset.UtcNow);
+                }
+
+                evt.IsProcessSuspended = resumeResult.RootStillSuspended;
+                evt.SuspendedChildProcessIds = remainingChildren.OrderBy(p => p).ToList();
+                evt.SuspendedChildInstances = evt.SuspendedChildInstances
+                    .Where(inst => remainingChildren.Contains(inst.ProcessId))
+                    .ToList();
             }
             evt.ActionTaken = SecurityActionTaken.FirewallBlocked;
         }
@@ -491,28 +595,105 @@ public sealed class SecurityOrchestrator : IDisposable
         bool hasTargetProcess = evt.ProcessId > 4;
         bool killed = false;
         var detailParts = new List<string>();
+        var handledChildPids = new HashSet<int>();
+
+        // P1-1: Terminate frozen child instances FIRST using single-handle creation-time verification
+        // so recycled PIDs belonging to unrelated newer processes are NEVER terminated.
+        foreach (var childInst in evt.SuspendedChildInstances.ToList())
+        {
+            if (childInst.ProcessId <= 4 || childInst.ProcessId == evt.ProcessId) continue;
+            handledChildPids.Add(childInst.ProcessId);
+            _activeInterventionPids.TryRemove(childInst.ProcessId, out _);
+            _riskEngine.ClearProcess(childInst.ProcessId);
+            _processController.TryTerminateProcessInstance(
+                childInst.ProcessId,
+                childInst.CreationTimeFileTimeUtc,
+                childInst.ExecutablePath);
+        }
+
+        // For any legacy SuspendedChildProcessIds without an explicit instance record,
+        // terminate ONLY if ProcessController still holds a verified creation time or executable path.
+        foreach (var suspendedChildPid in evt.SuspendedChildProcessIds.ToList())
+        {
+            if (suspendedChildPid <= 4 || suspendedChildPid == evt.ProcessId || !handledChildPids.Add(suspendedChildPid))
+            {
+                continue;
+            }
+            _activeInterventionPids.TryRemove(suspendedChildPid, out _);
+            _riskEngine.ClearProcess(suspendedChildPid);
+            if (_processController.TryGetTrackedSuspendedInstance(suspendedChildPid, out var trackedChild) &&
+                trackedChild is not null &&
+                (trackedChild.CreationTimeFileTimeUtc != 0 || !string.IsNullOrWhiteSpace(trackedChild.ExecutablePath)))
+            {
+                _processController.TryTerminateProcessInstance(
+                    trackedChild.ProcessId,
+                    trackedChild.CreationTimeFileTimeUtc,
+                    trackedChild.ExecutablePath);
+            }
+        }
 
         if (hasTargetProcess)
         {
-            // PID-reuse guard: never kill an innocent process if Windows recycled a historical event's PID!
-            var livePath = _processController.GetExecutablePath(evt.ProcessId);
-            bool pidStillMatchesEvent = string.IsNullOrWhiteSpace(evt.ProcessPath) ||
-                                        (!string.IsNullOrWhiteSpace(livePath) && livePath.Equals(evt.ProcessPath, StringComparison.OrdinalIgnoreCase));
-
             _activeInterventionPids.TryRemove(evt.ProcessId, out _);
             _riskEngine.ClearProcess(evt.ProcessId);
 
-            if (pidStillMatchesEvent)
+            // Verify root process identity before inspecting live descendants so a recycled root PID never kills innocent children.
+            bool rootIdentityMatches = true;
+            if (_processController.TryGetProcessInstanceIdentity(evt.ProcessId, out var liveRoot) && liveRoot is not null)
             {
-                var descendants = new HashSet<int>(_treeTracker.GetDescendantPids(evt.ProcessId));
-                foreach (var suspendedChild in evt.SuspendedChildProcessIds) descendants.Add(suspendedChild);
-                foreach (var childPid in descendants)
+                if (evt.ProcessCreationTimeFileTimeUtc != 0 &&
+                    liveRoot.CreationTimeFileTimeUtc != 0 &&
+                    liveRoot.CreationTimeFileTimeUtc != evt.ProcessCreationTimeFileTimeUtc)
                 {
-                    _activeInterventionPids.TryRemove(childPid, out _);
-                    _riskEngine.ClearProcess(childPid);
-                    _processController.TryTerminateProcess(childPid);
+                    rootIdentityMatches = false;
                 }
-                killed = _processController.TryTerminateProcess(evt.ProcessId);
+                else if (!string.IsNullOrWhiteSpace(evt.ProcessPath) &&
+                         !string.IsNullOrWhiteSpace(liveRoot.ExecutablePath) &&
+                         !liveRoot.ExecutablePath.Equals(evt.ProcessPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    rootIdentityMatches = false;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(evt.ProcessPath))
+            {
+                var livePath = _processController.GetExecutablePath(evt.ProcessId);
+                rootIdentityMatches = !string.IsNullOrWhiteSpace(livePath) &&
+                                      livePath.Equals(evt.ProcessPath, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (rootIdentityMatches)
+            {
+                foreach (var descPid in _treeTracker.GetDescendantPids(evt.ProcessId))
+                {
+                    if (descPid <= 4 || descPid == evt.ProcessId || !handledChildPids.Add(descPid))
+                    {
+                        continue;
+                    }
+                    _activeInterventionPids.TryRemove(descPid, out _);
+                    _riskEngine.ClearProcess(descPid);
+
+                    if (_processController.TryGetProcessInstanceIdentity(descPid, out var descIdentity) && descIdentity is not null)
+                    {
+                        // A genuine live child cannot have been created before its parent.
+                        if (evt.ProcessCreationTimeFileTimeUtc != 0 &&
+                            descIdentity.CreationTimeFileTimeUtc != 0 &&
+                            descIdentity.CreationTimeFileTimeUtc < evt.ProcessCreationTimeFileTimeUtc)
+                        {
+                            continue;
+                        }
+                        _processController.TryTerminateProcessInstance(
+                            descPid,
+                            descIdentity.CreationTimeFileTimeUtc,
+                            descIdentity.ExecutablePath);
+                    }
+                }
+
+                killed = (evt.ProcessCreationTimeFileTimeUtc != 0 || !string.IsNullOrWhiteSpace(evt.ProcessPath))
+                    ? _processController.TryTerminateProcessInstance(
+                        evt.ProcessId,
+                        evt.ProcessCreationTimeFileTimeUtc,
+                        evt.ProcessPath)
+                    : _processController.TryTerminateProcess(evt.ProcessId);
             }
 
             evt.ProcessTerminationSucceeded = killed;
@@ -520,6 +701,7 @@ public sealed class SecurityOrchestrator : IDisposable
         }
         evt.IsProcessSuspended = false;
         evt.SuspendedChildProcessIds.Clear();
+        evt.SuspendedChildInstances.Clear();
 
         // TargetPath is only the malicious file for static file / DLL / USB drops.
         // For behavioral process attacks (Ransomware, CredentialAccess, SupplyChain, etc.),
@@ -688,11 +870,25 @@ public sealed class SecurityOrchestrator : IDisposable
     {
         var now = DateTimeOffset.UtcNow;
 
-        // Enrich missing ProcessPath / Signature up front so whitelist, PID-reuse verification,
+        // Enrich missing ProcessPath / CreationTime / Signature up front so whitelist, PID-reuse verification,
         // ThreatPromptWindow UI, and Strict-mode signature checks always operate on complete metadata.
-        if (evt.ProcessId > 4 && string.IsNullOrWhiteSpace(evt.ProcessPath))
+        if (evt.ProcessId > 4 && (string.IsNullOrWhiteSpace(evt.ProcessPath) || evt.ProcessCreationTimeFileTimeUtc == 0))
         {
-            evt.ProcessPath = _processController.GetExecutablePath(evt.ProcessId);
+            if (_processController.TryGetProcessInstanceIdentity(evt.ProcessId, out var liveIdentity) && liveIdentity is not null)
+            {
+                if (evt.ProcessCreationTimeFileTimeUtc == 0 && liveIdentity.CreationTimeFileTimeUtc != 0)
+                {
+                    evt.ProcessCreationTimeFileTimeUtc = liveIdentity.CreationTimeFileTimeUtc;
+                }
+                if (string.IsNullOrWhiteSpace(evt.ProcessPath) && !string.IsNullOrWhiteSpace(liveIdentity.ExecutablePath))
+                {
+                    evt.ProcessPath = liveIdentity.ExecutablePath;
+                }
+            }
+            else if (string.IsNullOrWhiteSpace(evt.ProcessPath))
+            {
+                evt.ProcessPath = _processController.GetExecutablePath(evt.ProcessId);
+            }
         }
 
         // 1. Respect session-level user "Allow Once" ONLY if the PID still belongs to the exact same executable path
@@ -850,10 +1046,15 @@ public sealed class SecurityOrchestrator : IDisposable
                 (evt.Signature is null || !evt.Signature.IsSigned))
             {
                 var strictFreeze = _processController.TrySuspendProcessTreeDetailed(evt.ProcessId, descendants);
+                if (strictFreeze.RootInstance is { CreationTimeFileTimeUtc: > 0 })
+                {
+                    evt.ProcessCreationTimeFileTimeUtc = strictFreeze.RootInstance.CreationTimeFileTimeUtc;
+                }
                 if (strictFreeze.AnySuspended)
                 {
                     _metrics.IncrementProcessFrozen();
                     evt.SuspendedChildProcessIds = strictFreeze.SuspendedChildPids.ToList();
+                    evt.SuspendedChildInstances = strictFreeze.SuspendedChildInstances?.ToList() ?? new List<ProcessInstanceIdentity>();
                     evt.AttemptedChildFreezeCount = strictFreeze.AttemptedChildCount;
                 }
                 KillAndQuarantine(evt);
@@ -867,8 +1068,13 @@ public sealed class SecurityOrchestrator : IDisposable
             }
 
             var freezeResult = _processController.TrySuspendProcessTreeDetailed(evt.ProcessId, descendants);
+            if (freezeResult.RootInstance is { CreationTimeFileTimeUtc: > 0 })
+            {
+                evt.ProcessCreationTimeFileTimeUtc = freezeResult.RootInstance.CreationTimeFileTimeUtc;
+            }
             evt.IsProcessSuspended = freezeResult.RootSuspended;
             evt.SuspendedChildProcessIds = freezeResult.SuspendedChildPids.ToList();
+            evt.SuspendedChildInstances = freezeResult.SuspendedChildInstances?.ToList() ?? new List<ProcessInstanceIdentity>();
             evt.AttemptedChildFreezeCount = freezeResult.AttemptedChildCount;
 
             if (freezeResult.AnySuspended)

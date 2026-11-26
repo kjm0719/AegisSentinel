@@ -1,10 +1,72 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Management;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
+using AegisSentinel.Core.Models;
 using AegisSentinel.Core.Native;
 
 namespace AegisSentinel.Core.Services;
+
+public interface IProcessNativeOperations
+{
+    IntPtr OpenProcess(uint desiredAccess, int pid, out int lastWin32Error);
+    void CloseHandle(IntPtr handle);
+    bool TryGetCreationTimeFileTimeUtc(IntPtr handle, out long creationTimeFileTimeUtc);
+    bool TryGetExitCode(IntPtr handle, out uint exitCode);
+    string QueryExecutablePath(IntPtr handle);
+    int SuspendProcess(IntPtr handle);
+    int ResumeProcess(IntPtr handle);
+    bool TerminateProcess(IntPtr handle, uint exitCode);
+}
+
+internal sealed class Win32ProcessNativeOperations : IProcessNativeOperations
+{
+    public IntPtr OpenProcess(uint desiredAccess, int pid, out int lastWin32Error)
+    {
+        var handle = NativeMethods.OpenProcess(desiredAccess, false, pid);
+        lastWin32Error = handle == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+        return handle;
+    }
+
+    public void CloseHandle(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero)
+        {
+            NativeMethods.CloseHandle(handle);
+        }
+    }
+
+    public bool TryGetCreationTimeFileTimeUtc(IntPtr handle, out long creationTimeFileTimeUtc)
+    {
+        if (NativeMethods.GetProcessTimes(handle, out long creation, out _, out _, out _))
+        {
+            creationTimeFileTimeUtc = creation;
+            return true;
+        }
+        creationTimeFileTimeUtc = 0;
+        return false;
+    }
+
+    public bool TryGetExitCode(IntPtr handle, out uint exitCode) =>
+        NativeMethods.GetExitCodeProcess(handle, out exitCode);
+
+    public string QueryExecutablePath(IntPtr handle)
+    {
+        var sb = new StringBuilder(1024);
+        var size = (uint)sb.Capacity;
+        return NativeMethods.QueryFullProcessImageName(handle, 0, sb, ref size)
+            ? sb.ToString()
+            : string.Empty;
+    }
+
+    public int SuspendProcess(IntPtr handle) => NativeMethods.NtSuspendProcess(handle);
+
+    public int ResumeProcess(IntPtr handle) => NativeMethods.NtResumeProcess(handle);
+
+    public bool TerminateProcess(IntPtr handle, uint exitCode) => NativeMethods.TerminateProcess(handle, exitCode);
+}
 
 public sealed class ProcessController
 {
@@ -27,7 +89,19 @@ public sealed class ProcessController
         "System", "Idle", "Registry", "Memory Compression", "Secure System", "LsaIso", "vmmem", "vmmemWSL"
     };
 
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _suspendedPids = new();
+    private readonly ConcurrentDictionary<int, ProcessInstanceIdentity> _suspendedPids = new();
+    private readonly Func<int, bool>? _suspendPidOverride;
+    private readonly IProcessNativeOperations _nativeOps;
+    private readonly bool _isDefaultWin32Ops;
+
+    public ProcessController(
+        Func<int, bool>? suspendPidOverride = null,
+        IProcessNativeOperations? nativeOps = null)
+    {
+        _suspendPidOverride = suspendPidOverride;
+        _isDefaultWin32Ops = nativeOps is null;
+        _nativeOps = nativeOps ?? new Win32ProcessNativeOperations();
+    }
 
     public static bool IsCurrentProcessElevated()
     {
@@ -46,12 +120,25 @@ public sealed class ProcessController
         var rawPath = GetExecutablePath(pid);
         if (string.IsNullOrWhiteSpace(rawPath))
         {
-            try
+            if (_isDefaultWin32Ops)
             {
-                using var p = Process.GetProcessById(pid);
-                if (KernelPseudoProcessNames.Contains(p.ProcessName)) return true;
+                try
+                {
+                    using var p = Process.GetProcessById(pid);
+                    if (KernelPseudoProcessNames.Contains(p.ProcessName)) return true;
+                }
+                catch { }
             }
-            catch { }
+            return false;
+        }
+
+        return IsCriticalProtectedPath(rawPath);
+    }
+
+    public bool IsCriticalProtectedPath(string? rawPath)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
             return false;
         }
 
@@ -115,11 +202,47 @@ public sealed class ProcessController
 
     public bool IsProcessSuspendedByUs(int pid) => _suspendedPids.ContainsKey(pid);
 
+    public IReadOnlyCollection<int> GetTrackedSuspendedPids() => _suspendedPids.Keys.ToList();
+
+    public bool TryGetTrackedSuspendedInstance(int pid, out ProcessInstanceIdentity? instance) =>
+        _suspendedPids.TryGetValue(pid, out instance);
+
+    public bool TryGetProcessInstanceIdentity(int pid, out ProcessInstanceIdentity? identity)
+    {
+        identity = null;
+        if (pid <= 4)
+        {
+            return false;
+        }
+
+        var handle = _nativeOps.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, pid, out _);
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
+            {
+                return false;
+            }
+            _nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long creationTimeUtc);
+            var exePath = _nativeOps.QueryExecutablePath(handle);
+            identity = new ProcessInstanceIdentity(pid, creationTimeUtc, exePath);
+            return true;
+        }
+        finally
+        {
+            _nativeOps.CloseHandle(handle);
+        }
+    }
+
     public void ResumeAllSuspendedProcesses()
     {
         foreach (var pid in _suspendedPids.Keys.ToList())
         {
-            TryResumeProcess(pid);
+            TryResumeProcessDetailed(pid);
         }
     }
 
@@ -127,165 +250,366 @@ public sealed class ProcessController
         int RootPid,
         bool RootSuspended,
         IReadOnlyList<int> SuspendedChildPids,
-        int AttemptedChildCount)
+        int AttemptedChildCount,
+        ProcessInstanceIdentity? RootInstance = null,
+        IReadOnlyList<ProcessInstanceIdentity>? SuspendedChildInstances = null)
     {
         public int TotalSuspendedCount => (RootSuspended ? 1 : 0) + SuspendedChildPids.Count;
         public bool AnySuspended => TotalSuspendedCount > 0;
     }
 
-    private readonly Func<int, bool>? _suspendPidOverride;
-
-    public ProcessController(Func<int, bool>? suspendPidOverride = null)
-    {
-        _suspendPidOverride = suspendPidOverride;
-    }
-
     /// <summary>
     /// Suspends both the offending root process and any non-critical descendant processes
-    /// it spawned, returning exact per-process results so callers never misreport partial freezes.
+    /// it spawned, returning exact per-process results and instance identities so callers
+    /// never misreport partial freezes or act on recycled PIDs later.
     /// </summary>
     public ProcessTreeSuspensionResult TrySuspendProcessTreeDetailed(int rootPid, IEnumerable<int> descendantPids)
     {
-        bool rootSuspended = TrySuspendProcess(rootPid);
+        bool rootSuspended = TrySuspendProcessDetailed(rootPid, out var rootInstance);
         var suspendedChildren = new List<int>();
+        var suspendedChildInstances = new List<ProcessInstanceIdentity>();
         int attemptedChildren = 0;
 
         foreach (var childPid in descendantPids.Distinct())
         {
             if (childPid == rootPid || childPid <= 4) continue;
             attemptedChildren++;
-            if (TrySuspendProcess(childPid))
+            if (TrySuspendProcessDetailed(childPid, out var childInstance))
             {
                 suspendedChildren.Add(childPid);
+                suspendedChildInstances.Add(childInstance ?? new ProcessInstanceIdentity(childPid, 0, string.Empty));
             }
         }
 
-        return new ProcessTreeSuspensionResult(rootPid, rootSuspended, suspendedChildren, attemptedChildren);
+        return new ProcessTreeSuspensionResult(
+            rootPid,
+            rootSuspended,
+            suspendedChildren,
+            attemptedChildren,
+            rootInstance,
+            suspendedChildInstances);
     }
 
     public int TrySuspendProcessTree(int rootPid, IEnumerable<int> descendantPids) =>
         TrySuspendProcessTreeDetailed(rootPid, descendantPids).TotalSuspendedCount;
 
-    public int TryResumeProcessTree(int rootPid, IEnumerable<int> descendantPids)
+    public ProcessTreeResumeResult TryResumeProcessTreeDetailed(
+        int rootPid,
+        long rootExpectedCreationTimeUtc,
+        IEnumerable<ProcessInstanceIdentity>? childInstances,
+        IEnumerable<int>? fallbackChildPids = null)
     {
-        int resumed = 0;
-        if (TryResumeProcess(rootPid))
+        ProcessResumeStatus? rootStatus = null;
+        if (rootPid > 4 && IsProcessSuspendedByUs(rootPid))
         {
-            resumed++;
+            rootStatus = TryResumeProcessDetailed(rootPid, rootExpectedCreationTimeUtc).Status;
         }
 
-        foreach (var childPid in descendantPids)
+        var childTargets = new Dictionary<int, long>();
+        if (childInstances is not null)
         {
-            if (childPid != rootPid && IsProcessSuspendedByUs(childPid) && TryResumeProcess(childPid))
+            foreach (var inst in childInstances)
             {
-                resumed++;
+                if (inst.ProcessId <= 4 || inst.ProcessId == rootPid) continue;
+                if (!childTargets.TryGetValue(inst.ProcessId, out var existing) || (existing == 0 && inst.CreationTimeFileTimeUtc != 0))
+                {
+                    childTargets[inst.ProcessId] = inst.CreationTimeFileTimeUtc;
+                }
+            }
+        }
+        if (fallbackChildPids is not null)
+        {
+            foreach (var childPid in fallbackChildPids)
+            {
+                if (childPid <= 4 || childPid == rootPid) continue;
+                childTargets.TryAdd(childPid, 0);
             }
         }
 
+        var childResults = new List<ProcessResumeItemResult>();
+        foreach (var kvp in childTargets)
+        {
+            if (IsProcessSuspendedByUs(kvp.Key))
+            {
+                childResults.Add(TryResumeProcessDetailed(kvp.Key, kvp.Value));
+            }
+        }
+
+        return new ProcessTreeResumeResult(rootPid, rootStatus, childResults);
+    }
+
+    public int TryResumeProcessTree(int rootPid, IEnumerable<int> descendantPids)
+    {
+        var result = TryResumeProcessTreeDetailed(rootPid, 0, null, descendantPids);
+        int resumed = result.RootStatus == ProcessResumeStatus.Resumed ? 1 : 0;
+        resumed += result.ChildResults.Count(r => r.Status == ProcessResumeStatus.Resumed);
         return resumed;
     }
 
-    private static long GetProcessStartTicksSafe(int pid)
+    public bool TrySuspendProcessDetailed(int pid, out ProcessInstanceIdentity? instance)
     {
-        try
-        {
-            using var proc = Process.GetProcessById(pid);
-            return proc.StartTime.ToUniversalTime().Ticks;
-        }
-        catch
-        {
-            return 0;
-        }
-    }
-
-    public bool TrySuspendProcess(int pid)
-    {
+        instance = null;
         if (_suspendPidOverride is not null)
         {
             bool ok = _suspendPidOverride(pid);
-            if (ok) _suspendedPids[pid] = 1;
+            if (ok)
+            {
+                instance = new ProcessInstanceIdentity(pid, 0, string.Empty);
+                _suspendedPids[pid] = instance;
+            }
             return ok;
         }
 
-        if (IsCriticalProtectedProcess(pid))
+        if (pid <= 4 || pid == Environment.ProcessId || InternalHelperProcessRegistry.IsInternalHelper(pid))
         {
             return false;
         }
 
-        long currentStartTicks = GetProcessStartTicksSafe(pid);
-        // Idempotent guard with PID-reuse check: never double-suspend the same process instance,
-        // while still suspending a newly spawned process if Windows recycled a dead PID!
-        if (_suspendedPids.TryGetValue(pid, out var existingTicks))
-        {
-            if (existingTicks != 0 && currentStartTicks != 0 && existingTicks == currentStartTicks)
-            {
-                return true;
-            }
-            _suspendedPids.TryRemove(pid, out _);
-        }
-
-        if (!_suspendedPids.TryAdd(pid, currentStartTicks))
-        {
-            return true;
-        }
-
-        var handle = NativeMethods.OpenProcess(NativeMethods.PROCESS_SUSPEND_RESUME, false, pid);
+        // Open a single handle for both identity inspection and suspension (zero TOCTOU between path/creation-time check and NtSuspendProcess).
+        var handle = _nativeOps.OpenProcess(
+            NativeMethods.PROCESS_SUSPEND_RESUME | NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION,
+            pid,
+            out _);
         if (handle == IntPtr.Zero)
         {
-            _suspendedPids.TryRemove(pid, out _);
             return false;
         }
 
         try
         {
-            if (NativeMethods.NtSuspendProcess(handle) == 0)
+            if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
             {
+                return false;
+            }
+
+            var path = _nativeOps.QueryExecutablePath(handle);
+            if (IsCriticalProtectedPath(path))
+            {
+                return false;
+            }
+
+            _nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long creationTimeUtc);
+
+            // Idempotent guard with handle-verified creation-time check: never double-suspend the same process instance,
+            // while still suspending a newly spawned process if Windows recycled a dead PID.
+            if (_suspendedPids.TryGetValue(pid, out var existing))
+            {
+                if (existing.CreationTimeFileTimeUtc != 0 && creationTimeUtc != 0 &&
+                    existing.CreationTimeFileTimeUtc == creationTimeUtc)
+                {
+                    instance = existing;
+                    return true;
+                }
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, existing));
+            }
+
+            if (_nativeOps.SuspendProcess(handle) == 0)
+            {
+                instance = new ProcessInstanceIdentity(pid, creationTimeUtc, path);
+                _suspendedPids[pid] = instance;
                 return true;
             }
-            _suspendedPids.TryRemove(pid, out _);
+
             return false;
         }
         finally
         {
-            NativeMethods.CloseHandle(handle);
+            _nativeOps.CloseHandle(handle);
         }
     }
 
-    public bool TryResumeProcess(int pid)
+    public bool TrySuspendProcess(int pid) => TrySuspendProcessDetailed(pid, out _);
+
+    public ProcessResumeItemResult TryResumeProcessDetailed(int pid, long expectedCreationTimeUtc = 0)
     {
-        if (!_suspendedPids.TryRemove(pid, out var savedTicks))
+        if (!_suspendedPids.TryGetValue(pid, out var tracked))
         {
-            return false;
+            return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "추적 중인 동결 상태 없음");
         }
+
         if (pid <= 4 || pid == Environment.ProcessId)
         {
+            _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+            return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "시스템/자체 프로세스");
+        }
+
+        long targetCreationTime = expectedCreationTimeUtc != 0
+            ? expectedCreationTimeUtc
+            : tracked.CreationTimeFileTimeUtc;
+
+        var handle = _nativeOps.OpenProcess(
+            NativeMethods.PROCESS_SUSPEND_RESUME | NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION,
+            pid,
+            out int openError);
+        if (handle == IntPtr.Zero)
+        {
+            if (openError == NativeMethods.ERROR_INVALID_PARAMETER)
+            {
+                // OS confirmed this PID no longer exists.
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "프로세스가 이미 종료됨");
+            }
+
+            // Keep tracking entry intact so user/orchestrator can retry resume later!
+            return new ProcessResumeItemResult(
+                pid,
+                ProcessResumeStatus.TransientFailureRetryRequired,
+                $"핸들 열기 실패(Win32={openError}) — 재시도 필요");
+        }
+
+        try
+        {
+            if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
+            {
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "프로세스가 이미 종료됨");
+            }
+
+            if (targetCreationTime != 0 &&
+                _nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long liveCreationTime) &&
+                liveCreationTime != 0 &&
+                liveCreationTime != targetCreationTime)
+            {
+                // PID was recycled to a different process instance — do not resume it, and clear stale tracking.
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "PID가 다른 프로세스로 교체됨");
+            }
+
+            int ntStatus = _nativeOps.ResumeProcess(handle);
+            if (ntStatus == 0)
+            {
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                return new ProcessResumeItemResult(pid, ProcessResumeStatus.Resumed, "정상 재개 완료");
+            }
+
+            if (ntStatus == NativeMethods.STATUS_PROCESS_IS_TERMINATING)
+            {
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
+                return new ProcessResumeItemResult(pid, ProcessResumeStatus.AlreadyExitedOrReplaced, "프로세스 종료 진행 중");
+            }
+
+            // Transient resume failure: keep in _suspendedPids for retry.
+            return new ProcessResumeItemResult(
+                pid,
+                ProcessResumeStatus.TransientFailureRetryRequired,
+                $"재개 실패(NTSTATUS=0x{ntStatus:X8}) — 재시도 필요");
+        }
+        finally
+        {
+            _nativeOps.CloseHandle(handle);
+        }
+    }
+
+    public bool TryResumeProcess(int pid) =>
+        TryResumeProcessDetailed(pid).Status == ProcessResumeStatus.Resumed;
+
+    /// <summary>
+    /// Terminates a specific process instance using ONE handle for both identity verification
+    /// (creation time + executable path + critical-process check) and TerminateProcess,
+    /// completely eliminating PID-reuse TOCTOU windows.
+    /// </summary>
+    public bool TryTerminateProcessInstance(int pid, long expectedCreationTimeUtc, string? expectedExecutablePath = null)
+    {
+        if (pid <= 4 || pid == Environment.ProcessId || InternalHelperProcessRegistry.IsInternalHelper(pid))
+        {
             return false;
         }
 
-        long currentTicks = GetProcessStartTicksSafe(pid);
-        if (savedTicks != 0 && currentTicks != 0 && savedTicks != currentTicks)
-        {
-            return false; // PID was recycled to a different process
-        }
-
-        var handle = NativeMethods.OpenProcess(NativeMethods.PROCESS_SUSPEND_RESUME, false, pid);
+        var handle = _nativeOps.OpenProcess(
+            NativeMethods.PROCESS_TERMINATE | NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION,
+            pid,
+            out int openError);
         if (handle == IntPtr.Zero)
         {
+            if (openError == NativeMethods.ERROR_INVALID_PARAMETER &&
+                _suspendedPids.TryGetValue(pid, out var stale) &&
+                (expectedCreationTimeUtc == 0 || stale.CreationTimeFileTimeUtc == expectedCreationTimeUtc))
+            {
+                _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, stale));
+            }
             return false;
         }
 
         try
         {
-            return NativeMethods.NtResumeProcess(handle) == 0;
+            if (_nativeOps.TryGetExitCode(handle, out uint exitCode) && exitCode != NativeMethods.STILL_ACTIVE)
+            {
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                return false;
+            }
+
+            var livePath = _nativeOps.QueryExecutablePath(handle);
+            if (IsCriticalProtectedPath(livePath))
+            {
+                return false;
+            }
+
+            if (expectedCreationTimeUtc != 0)
+            {
+                if (!_nativeOps.TryGetCreationTimeFileTimeUtc(handle, out long liveCreationTime) ||
+                    liveCreationTime != expectedCreationTimeUtc)
+                {
+                    // PID has been recycled to a different process instance — refuse to terminate!
+                    RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                    return false;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(expectedExecutablePath))
+            {
+                if (string.IsNullOrWhiteSpace(livePath) ||
+                    !livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
+            if (expectedCreationTimeUtc != 0 &&
+                !string.IsNullOrWhiteSpace(expectedExecutablePath) &&
+                !string.IsNullOrWhiteSpace(livePath) &&
+                !livePath.Equals(expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            bool terminated = _nativeOps.TerminateProcess(handle, 1);
+            if (terminated)
+            {
+                RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+            }
+            return terminated;
         }
         finally
         {
-            NativeMethods.CloseHandle(handle);
+            _nativeOps.CloseHandle(handle);
+        }
+    }
+
+    private void RemoveTrackedIfMatching(int pid, long expectedCreationTimeUtc)
+    {
+        if (_suspendedPids.TryGetValue(pid, out var tracked) &&
+            (expectedCreationTimeUtc == 0 || tracked.CreationTimeFileTimeUtc == 0 || tracked.CreationTimeFileTimeUtc == expectedCreationTimeUtc))
+        {
+            _suspendedPids.TryRemove(new KeyValuePair<int, ProcessInstanceIdentity>(pid, tracked));
         }
     }
 
     public bool TryTerminateProcess(int pid)
     {
+        if (pid <= 4 || pid == Environment.ProcessId || InternalHelperProcessRegistry.IsInternalHelper(pid))
+        {
+            return false;
+        }
+
+        if (_suspendedPids.TryGetValue(pid, out var tracked) && tracked.CreationTimeFileTimeUtc != 0)
+        {
+            return TryTerminateProcessInstance(pid, tracked.CreationTimeFileTimeUtc, tracked.ExecutablePath);
+        }
+
+        if (!_isDefaultWin32Ops)
+        {
+            return TryTerminateProcessInstance(pid, 0, null);
+        }
+
         _suspendedPids.TryRemove(pid, out _);
         if (IsCriticalProtectedProcess(pid))
         {
@@ -302,23 +626,10 @@ public sealed class ProcessController
         }
         catch
         {
-            // Fall back to direct Win32 TerminateProcess
+            // Fall back to direct Win32 TerminateProcess on a single handle
         }
 
-        var handle = NativeMethods.OpenProcess(NativeMethods.PROCESS_TERMINATE, false, pid);
-        if (handle != IntPtr.Zero)
-        {
-            try
-            {
-                return NativeMethods.TerminateProcess(handle, 1);
-            }
-            finally
-            {
-                NativeMethods.CloseHandle(handle);
-            }
-        }
-
-        return false;
+        return TryTerminateProcessInstance(pid, 0, null);
     }
 
     private bool HasAnyProtectedDescendant(int rootPid)
@@ -369,33 +680,37 @@ public sealed class ProcessController
             return string.Empty;
         }
 
-        var handle = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        var handle = _nativeOps.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, pid, out _);
         if (handle != IntPtr.Zero)
         {
             try
             {
-                var sb = new StringBuilder(1024);
-                var size = (uint)sb.Capacity;
-                if (NativeMethods.QueryFullProcessImageName(handle, 0, sb, ref size))
+                var path = _nativeOps.QueryExecutablePath(handle);
+                if (!string.IsNullOrEmpty(path))
                 {
-                    return sb.ToString();
+                    return path;
                 }
             }
             finally
             {
-                NativeMethods.CloseHandle(handle);
+                _nativeOps.CloseHandle(handle);
             }
         }
 
-        try
+        if (_isDefaultWin32Ops)
         {
-            using var proc = Process.GetProcessById(pid);
-            return proc.MainModule?.FileName ?? string.Empty;
+            try
+            {
+                using var proc = Process.GetProcessById(pid);
+                return proc.MainModule?.FileName ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
-        catch
-        {
-            return string.Empty;
-        }
+
+        return string.Empty;
     }
 
     public (int ParentPid, string CommandLine) GetWmiProcessMetadata(int pid)

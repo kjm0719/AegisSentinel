@@ -12,15 +12,21 @@ public partial class ThreatPromptWindow : Window
 {
     private readonly SecurityOrchestrator _orchestrator;
     private readonly SecurityEvent _event;
+    private readonly Func<string, string, MessageBoxButton, MessageBoxImage, MessageBoxResult>? _messageBoxOverride;
     private bool _decisionHandled;
 
     public SecurityEvent SecurityEvent => _event;
 
-    public ThreatPromptWindow(SecurityOrchestrator orchestrator, SecurityEvent securityEvent, int queuedRemainingCount = 0)
+    public ThreatPromptWindow(
+        SecurityOrchestrator orchestrator,
+        SecurityEvent securityEvent,
+        int queuedRemainingCount = 0,
+        Func<string, string, MessageBoxButton, MessageBoxImage, MessageBoxResult>? messageBoxOverride = null)
     {
         InitializeComponent();
         _orchestrator = orchestrator;
         _event = securityEvent;
+        _messageBoxOverride = messageBoxOverride;
         securityEvent.EnsureMitrePopulated();
 
         // Anchor cleanly at bottom-right of WorkArea without stealing active keyboard focus
@@ -31,62 +37,9 @@ public partial class ThreatPromptWindow : Window
 
         SeverityBadgeText.Text = $"{securityEvent.Severity.ToString().ToUpperInvariant()} | {securityEvent.MitreTechniqueId}";
         RiskScoreBadgeText.Text = $"RISK {securityEvent.RiskScore}/100";
-        if (securityEvent.IsProcessSuspended)
-        {
-            StatusPillText.Text = securityEvent.AttemptedChildFreezeCount > 0
-                ? $"프로세스 트리 일시정지됨 (부모 + 자식 {securityEvent.SuspendedChildProcessIds.Count}/{securityEvent.AttemptedChildFreezeCount}개 동결)"
-                : "프로세스 즉시 일시정지됨 (동결 상태 — 안전 확보)";
-        }
-        else if (securityEvent.SuspendedChildProcessIds.Count > 0)
-        {
-            StatusPillText.Text = $"부분 동결 주의 — 부모 실행 중 · 자식 {securityEvent.SuspendedChildProcessIds.Count}/{securityEvent.AttemptedChildFreezeCount}개만 동결됨";
-        }
-        else
-        {
-            StatusPillText.Text = "실시간 상관분석 보안 경고";
-        }
         TitleText.Text = securityEvent.Title;
         DescriptionText.Text = securityEvent.Description;
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"탐지 시각 : {securityEvent.Timestamp:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine($"MITRE     : {securityEvent.MitreTechniqueId} ({securityEvent.MitreTactic})");
-        sb.AppendLine($"위협 분류 : {securityEvent.Category} | 누적 위험도: {securityEvent.RiskScore}/100");
-        if (securityEvent.RiskSignals.Count > 0)
-        {
-            sb.AppendLine($"탐지 신호 : {string.Join(", ", securityEvent.RiskSignals)}");
-        }
-        sb.AppendLine($"프로세스  : {securityEvent.ProcessName} (PID: {securityEvent.ProcessId})");
-        if (!string.IsNullOrWhiteSpace(securityEvent.ProcessAncestry))
-        {
-            sb.AppendLine($"실행 계보 : {securityEvent.ProcessAncestry}");
-        }
-        if (!string.IsNullOrWhiteSpace(securityEvent.ProcessPath))
-        {
-            sb.AppendLine($"실행 경로 : {securityEvent.ProcessPath}");
-        }
-        if (!string.IsNullOrWhiteSpace(securityEvent.RemoteEndpoint))
-        {
-            sb.AppendLine($"외부 연결 : {securityEvent.RemoteEndpoint} {(string.IsNullOrWhiteSpace(securityEvent.RemoteDomain) ? "" : $"({securityEvent.RemoteDomain})")}");
-        }
-        if (securityEvent.Signature is not null)
-        {
-            sb.AppendLine($"디지털서명: {securityEvent.Signature.DisplayLabel}");
-        }
-        if (!string.IsNullOrWhiteSpace(securityEvent.CommandLine))
-        {
-            sb.AppendLine($"명령줄    : {securityEvent.CommandLine}");
-        }
-        if (!string.IsNullOrWhiteSpace(securityEvent.TargetPath))
-        {
-            sb.AppendLine($"대상 경로 : {securityEvent.TargetPath}");
-        }
-        if (!string.IsNullOrWhiteSpace(securityEvent.ContainmentDetail))
-        {
-            sb.AppendLine($"대응 상태 : {securityEvent.ContainmentDetail}");
-        }
-
-        ProcessDetailText.Text = sb.ToString();
+        RefreshSuspensionDisplay();
 
         bool isInformationalOnly = securityEvent.Category is ThreatCategory.SystemHardening or ThreatCategory.SelfDefenseTamper;
         bool hasExecutablePath = !string.IsNullOrWhiteSpace(securityEvent.ProcessPath) && File.Exists(securityEvent.ProcessPath);
@@ -140,6 +93,74 @@ public partial class ThreatPromptWindow : Window
         }
     }
 
+    public void RefreshSuspensionDisplay()
+    {
+        var securityEvent = _event;
+        RiskScoreBadgeText.Text = $"RISK {securityEvent.RiskScore}/100";
+        if (securityEvent.ActionTaken == SecurityActionTaken.PartiallyAllowed && securityEvent.HasAnySuspendedProcess)
+        {
+            StatusPillText.Text = $"부분 재개됨 — 아직 동결 중인 대상 재시도 필요 (자식 {securityEvent.SuspendedChildProcessIds.Count}개)";
+        }
+        else if (securityEvent.IsProcessSuspended)
+        {
+            StatusPillText.Text = securityEvent.AttemptedChildFreezeCount > 0
+                ? $"프로세스 트리 일시정지됨 (부모 + 자식 {securityEvent.SuspendedChildProcessIds.Count}/{securityEvent.AttemptedChildFreezeCount}개 동결)"
+                : "프로세스 즉시 일시정지됨 (동결 상태 — 안전 확보)";
+        }
+        else if (securityEvent.SuspendedChildProcessIds.Count > 0)
+        {
+            StatusPillText.Text = $"부분 동결 주의 — 부모 실행 중 · 자식 {securityEvent.SuspendedChildProcessIds.Count}/{Math.Max(securityEvent.AttemptedChildFreezeCount, securityEvent.SuspendedChildProcessIds.Count)}개만 동결됨";
+        }
+        else
+        {
+            StatusPillText.Text = "실시간 상관분석 보안 경고";
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"탐지 시각 : {securityEvent.Timestamp:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine($"MITRE     : {securityEvent.MitreTechniqueId} ({securityEvent.MitreTactic})");
+        sb.AppendLine($"위협 분류 : {securityEvent.Category} | 누적 위험도: {securityEvent.RiskScore}/100");
+        if (securityEvent.RiskSignals.Count > 0)
+        {
+            sb.AppendLine($"탐지 신호 : {string.Join(", ", securityEvent.RiskSignals)}");
+        }
+        sb.AppendLine($"프로세스  : {securityEvent.ProcessName} (PID: {securityEvent.ProcessId})");
+        if (securityEvent.SuspendedChildProcessIds.Count > 0)
+        {
+            sb.AppendLine($"동결 자식 : PID [{string.Join(", ", securityEvent.SuspendedChildProcessIds)}]");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.ProcessAncestry))
+        {
+            sb.AppendLine($"실행 계보 : {securityEvent.ProcessAncestry}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.ProcessPath))
+        {
+            sb.AppendLine($"실행 경로 : {securityEvent.ProcessPath}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.RemoteEndpoint))
+        {
+            sb.AppendLine($"외부 연결 : {securityEvent.RemoteEndpoint} {(string.IsNullOrWhiteSpace(securityEvent.RemoteDomain) ? "" : $"({securityEvent.RemoteDomain})")}");
+        }
+        if (securityEvent.Signature is not null)
+        {
+            sb.AppendLine($"디지털서명: {securityEvent.Signature.DisplayLabel}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.CommandLine))
+        {
+            sb.AppendLine($"명령줄    : {securityEvent.CommandLine}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.TargetPath))
+        {
+            sb.AppendLine($"대상 경로 : {securityEvent.TargetPath}");
+        }
+        if (!string.IsNullOrWhiteSpace(securityEvent.ContainmentDetail))
+        {
+            sb.AppendLine($"대응 상태 : {securityEvent.ContainmentDetail}");
+        }
+
+        ProcessDetailText.Text = sb.ToString();
+    }
+
     public void UpdateQueuedCount(int queuedCount)
     {
         if (queuedCount > 0)
@@ -175,15 +196,41 @@ public partial class ThreatPromptWindow : Window
 
     private void OnAllowOnceClick(object sender, RoutedEventArgs e)
     {
-        _decisionHandled = true;
-        _orchestrator.AllowAndResumeProcess(_event, addToWhitelist: false, grantSessionImmunity: true);
-        Close();
+        HandleResumeDecision(addToWhitelist: false);
     }
 
     private void OnTrustAndResumeClick(object sender, RoutedEventArgs e)
     {
+        HandleResumeDecision(addToWhitelist: true);
+    }
+
+    private MessageBoxResult ShowPromptMessageBox(string message, string caption, MessageBoxButton buttons, MessageBoxImage icon) =>
+        _messageBoxOverride is not null
+            ? _messageBoxOverride(message, caption, buttons, icon)
+            : System.Windows.MessageBox.Show(this, message, caption, buttons, icon);
+
+    private void HandleResumeDecision(bool addToWhitelist)
+    {
+        var result = _orchestrator.AllowAndResumeProcessDetailed(_event, addToWhitelist, grantSessionImmunity: true);
+        if (result.HasAnyPendingRetry)
+        {
+            RefreshSuspensionDisplay();
+            var pending = new List<int>();
+            if (result.RootStillSuspended) pending.Add(_event.ProcessId);
+            pending.AddRange(result.RemainingSuspendedChildPids);
+
+            ShowPromptMessageBox(
+                $"일부 프로세스의 재개가 일시적으로 실패하여 동결 추적 목록에 유지되었습니다.\n\n" +
+                $"재시도 필요 PID: {string.Join(", ", pending.Distinct())}\n" +
+                $"상태: {_event.ContainmentDetail}\n\n" +
+                "다시 허용 버튼을 눌러 재개를 재시도하거나, [종료 및 격리]를 선택할 수 있습니다.",
+                "부분 재개 경고 (재시도 필요)",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return;
+        }
+
         _decisionHandled = true;
-        _orchestrator.AllowAndResumeProcess(_event, addToWhitelist: true, grantSessionImmunity: true);
         Close();
     }
 

@@ -25,6 +25,9 @@ public sealed class QuarantineManager
     private readonly object _keySync = new();
     private readonly Func<string, bool>? _deleteFileOverride;
     private readonly Func<string, bool>? _scheduleRebootDeleteOverride;
+    private readonly Action<string, string>? _writeMetadataOverride;
+    private readonly Action<string, byte[]>? _writeRestoreTempOverride;
+    private readonly long _maxInMemoryGcmBytes;
     private byte[]? _cachedAesKey;
 
     public string QuarantineDirectory { get; }
@@ -32,7 +35,10 @@ public sealed class QuarantineManager
     public QuarantineManager(
         string? baseDirectory = null,
         Func<string, bool>? deleteFileOverride = null,
-        Func<string, bool>? scheduleRebootDeleteOverride = null)
+        Func<string, bool>? scheduleRebootDeleteOverride = null,
+        Action<string, string>? writeMetadataOverride = null,
+        Action<string, byte[]>? writeRestoreTempOverride = null,
+        long maxInMemoryGcmBytes = MaxInMemoryGcmBytes)
     {
         var root = baseDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -42,6 +48,9 @@ public sealed class QuarantineManager
         _keyFilePath = Path.Combine(QuarantineDirectory, ".quarantine_aes.key");
         _deleteFileOverride = deleteFileOverride;
         _scheduleRebootDeleteOverride = scheduleRebootDeleteOverride;
+        _writeMetadataOverride = writeMetadataOverride;
+        _writeRestoreTempOverride = writeRestoreTempOverride;
+        _maxInMemoryGcmBytes = Math.Max(0, maxInMemoryGcmBytes);
     }
 
     private byte[] GetOrCreateAesKey()
@@ -113,13 +122,13 @@ public sealed class QuarantineManager
 
         try
         {
-            if (fileSize <= MaxInMemoryGcmBytes)
+            if (fileSize <= _maxInMemoryGcmBytes)
             {
                 // Single-pass TOCTOU-free read + SHA-256 + AES-256-GCM AEAD encryption
                 byte[] plain;
                 using (var input = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
-                    using var ms = new MemoryStream((int)Math.Min(fileSize, MaxInMemoryGcmBytes));
+                    using var ms = new MemoryStream((int)Math.Min(fileSize, _maxInMemoryGcmBytes));
                     input.CopyTo(ms);
                     plain = ms.ToArray();
                 }
@@ -142,6 +151,7 @@ public sealed class QuarantineManager
                     output.Write(nonce, 0, nonce.Length);
                     output.Write(tag, 0, tag.Length);
                     output.Write(cipher, 0, cipher.Length);
+                    output.Flush(flushToDisk: true);
                 }
                 finally
                 {
@@ -168,6 +178,7 @@ public sealed class QuarantineManager
                     output.Write(buffer, 0, bytesRead);
                     offset += bytesRead;
                 }
+                output.Flush(flushToDisk: true);
                 fileSize = offset;
                 sha256 = Convert.ToHexString(incHash.GetHashAndReset());
             }
@@ -175,6 +186,30 @@ public sealed class QuarantineManager
         catch
         {
             try { if (File.Exists(qFilePath)) File.Delete(qFilePath); } catch { }
+            throw;
+        }
+
+        // Crash-safe commit order (P1-4):
+        // Persist restore metadata atomically to disk BEFORE deleting the original file or scheduling reboot delete.
+        // If metadata persistence fails, abort cleanly leaving the original untouched and unscheduled.
+        var pendingEntry = new QuarantineEntry(
+            id,
+            originalPath,
+            qFilePath,
+            DateTimeOffset.Now,
+            reason,
+            sha256,
+            fileSize,
+            QuarantineDisposition.PendingOriginalRemoval);
+
+        try
+        {
+            WriteMetadataAtomic(metaPath, JsonSerializer.Serialize(pendingEntry, JsonOptions));
+        }
+        catch
+        {
+            try { if (File.Exists(qFilePath)) File.Delete(qFilePath); } catch { }
+            try { if (File.Exists(metaPath)) File.Delete(metaPath); } catch { }
             throw;
         }
 
@@ -206,19 +241,80 @@ public sealed class QuarantineManager
             }
         }
 
-        var entry = new QuarantineEntry(
-            id,
-            originalPath,
-            qFilePath,
-            DateTimeOffset.Now,
-            finalReason,
-            sha256,
-            fileSize,
-            disposition);
+        var entry = pendingEntry with
+        {
+            Reason = finalReason,
+            Disposition = disposition
+        };
 
-        File.WriteAllText(metaPath, JsonSerializer.Serialize(entry, JsonOptions));
+        try
+        {
+            WriteMetadataAtomic(metaPath, JsonSerializer.Serialize(entry, JsonOptions));
+        }
+        catch
+        {
+            // PendingOriginalRemoval metadata is already safely persisted on disk and will be reconciled on next load.
+        }
 
         return entry;
+    }
+
+    private void WriteMetadataAtomic(string metaPath, string json)
+    {
+        if (_writeMetadataOverride is not null)
+        {
+            _writeMetadataOverride(metaPath, json);
+            return;
+        }
+
+        var dir = Path.GetDirectoryName(metaPath) ?? QuarantineDirectory;
+        var tmpPath = Path.Combine(dir, $".{Path.GetFileName(metaPath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            var bytes = Encoding.UTF8.GetBytes(json);
+            using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(flushToDisk: true);
+            }
+
+            if (File.Exists(metaPath))
+            {
+                File.Replace(tmpPath, metaPath, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(tmpPath, metaPath, overwrite: false);
+            }
+
+            TryFlushDirectoryMetadata(dir);
+        }
+        finally
+        {
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+        }
+    }
+
+    private static void TryFlushDirectoryMetadata(string? directoryPath)
+    {
+        if (string.IsNullOrWhiteSpace(directoryPath)) return;
+        try
+        {
+            var handle = Native.NativeMethods.CreateFileW(
+                directoryPath,
+                Native.NativeMethods.GENERIC_WRITE,
+                Native.NativeMethods.FILE_SHARE_READ | Native.NativeMethods.FILE_SHARE_WRITE | Native.NativeMethods.FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                Native.NativeMethods.OPEN_EXISTING,
+                Native.NativeMethods.FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero);
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+            {
+                try { _ = Native.NativeMethods.FlushFileBuffers(handle); }
+                finally { Native.NativeMethods.CloseHandle(handle); }
+            }
+        }
+        catch { }
     }
 
     private static bool TryDeleteWithRetry(string path, int maxAttempts)
@@ -243,25 +339,32 @@ public sealed class QuarantineManager
         return !File.Exists(path);
     }
 
-    public bool RestoreFile(string entryId, string? overrideDestination = null)
+    public bool RestoreFile(string entryId, string? overrideDestination = null, bool overwriteExisting = false) =>
+        RestoreFileDetailed(entryId, overrideDestination, overwriteExisting).Success;
+
+    public QuarantineRestoreResult RestoreFileDetailed(
+        string entryId,
+        string? overrideDestination = null,
+        bool overwriteExisting = false)
     {
         if (string.IsNullOrWhiteSpace(entryId) || !System.Text.RegularExpressions.Regex.IsMatch(entryId, @"^[A-Za-z0-9_\-]+$"))
         {
-            return false;
+            return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, string.Empty, "유효하지 않은 격리 항목 ID입니다.");
         }
 
+        string destination = overrideDestination ?? string.Empty;
         try
         {
             var metaPath = Path.Combine(QuarantineDirectory, $"{entryId}.json");
             if (!File.Exists(metaPath))
             {
-                return false;
+                return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "격리 메타데이터를 찾을 수 없습니다.");
             }
 
             var entry = JsonSerializer.Deserialize<QuarantineEntry>(File.ReadAllText(metaPath));
             if (entry is null || string.IsNullOrWhiteSpace(entry.QuarantineFilePath) || !File.Exists(entry.QuarantineFilePath))
             {
-                return false;
+                return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "격리 사본 파일이 존재하지 않습니다.");
             }
 
             // Strictly confine QuarantineFilePath to QuarantineDirectory (prevents crafted JSON traversal)
@@ -269,87 +372,112 @@ public sealed class QuarantineManager
             var fullQFile = Path.GetFullPath(entry.QuarantineFilePath);
             if (!fullQFile.StartsWith(qRoot, StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "격리 파일 경로가 격리 디렉터리 범위를 벗어났습니다.");
             }
 
-            var destination = overrideDestination ?? entry.OriginalPath;
+            destination = Path.GetFullPath(overrideDestination ?? entry.OriginalPath);
             if (IsProtectedSystemOrSelfPath(destination) || HasAnyReparsePointAncestor(destination))
             {
-                return false;
+                return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "보호된 시스템/보안 경로 또는 리파스 포인트 하위 경로에는 복원할 수 없습니다.");
             }
-            if (File.Exists(destination))
+
+            bool destinationExists = File.Exists(destination);
+            if (destinationExists)
             {
                 if ((File.GetAttributes(destination) & FileAttributes.ReparsePoint) != 0)
                 {
-                    return false; // Never overwrite a symlink destination (Symlink Overwrite Escape defense)
+                    return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "복원 대상 경로가 심볼릭 링크/리파스 포인트이므로 차단되었습니다.");
                 }
-                try { File.SetAttributes(destination, FileAttributes.Normal); } catch { }
+
+                if (!overwriteExisting)
+                {
+                    return new QuarantineRestoreResult(
+                        QuarantineRestoreStatus.DestinationConflict,
+                        destination,
+                        $"복원 대상 위치에 이미 파일이 존재합니다: {destination}");
+                }
             }
+
             var destDir = Path.GetDirectoryName(destination);
             if (!string.IsNullOrEmpty(destDir))
             {
                 Directory.CreateDirectory(destDir);
             }
 
-            using (var input = new FileStream(fullQFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+            var tmpDest = Path.Combine(
+                string.IsNullOrEmpty(destDir) ? QuarantineDirectory : destDir,
+                $".{Path.GetFileName(destination)}.restore_{Guid.NewGuid():N}.tmp");
+
+            try
             {
-                var header = new byte[8];
-                int readHeader = input.Read(header, 0, header.Length);
-                if (readHeader != 8) return false;
-
-                if (header.SequenceEqual(AesGcmMagicHeader))
+                using (var input = new FileStream(fullQFile, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
-                    var nonce = new byte[GcmNonceSize];
-                    var tag = new byte[GcmTagSize];
-                    if (input.Read(nonce, 0, nonce.Length) != nonce.Length) return false;
-                    if (input.Read(tag, 0, tag.Length) != tag.Length) return false;
-
-                    long rawCipherLen = input.Length - input.Position;
-                    if (rawCipherLen < 0 || rawCipherLen > MaxInMemoryGcmBytes) return false;
-                    int cipherLen = (int)rawCipherLen;
-                    var cipher = new byte[cipherLen];
-                    int readCipher = 0;
-                    while (readCipher < cipherLen)
+                    var header = new byte[8];
+                    int readHeader = input.Read(header, 0, header.Length);
+                    if (readHeader != 8)
                     {
-                        int r = input.Read(cipher, readCipher, cipherLen - readCipher);
-                        if (r <= 0) break;
-                        readCipher += r;
+                        return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 헤더가 손상되었습니다.");
                     }
-                    if (readCipher != cipherLen) return false;
 
-                    var plain = new byte[cipherLen];
-                    try
+                    if (header.SequenceEqual(AesGcmMagicHeader))
                     {
-                        using (var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize))
+                        var nonce = new byte[GcmNonceSize];
+                        var tag = new byte[GcmTagSize];
+                        if (input.Read(nonce, 0, nonce.Length) != nonce.Length ||
+                            input.Read(tag, 0, tag.Length) != tag.Length)
                         {
-                            aes.Decrypt(nonce, cipher, tag, plain, AesGcmMagicHeader);
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "AES-GCM 메타데이터가 손상되었습니다.");
                         }
 
-                        if (!string.IsNullOrWhiteSpace(entry.Sha256))
+                        long rawCipherLen = input.Length - input.Position;
+                        if (rawCipherLen < 0 || rawCipherLen > MaxInMemoryGcmBytes)
                         {
-                            var actualSha = Convert.ToHexString(SHA256.HashData(plain));
-                            if (!actualSha.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 크기가 비정상적입니다.");
+                        }
+
+                        int cipherLen = (int)rawCipherLen;
+                        var cipher = new byte[cipherLen];
+                        int readCipher = 0;
+                        while (readCipher < cipherLen)
+                        {
+                            int r = input.Read(cipher, readCipher, cipherLen - readCipher);
+                            if (r <= 0) break;
+                            readCipher += r;
+                        }
+                        if (readCipher != cipherLen)
+                        {
+                            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "격리 파일 본문을 끝까지 읽지 못했습니다.");
+                        }
+
+                        var plain = new byte[cipherLen];
+                        try
+                        {
+                            using (var aes = new AesGcm(GetOrCreateAesKey(), GcmTagSize))
                             {
-                                return false;
+                                aes.Decrypt(nonce, cipher, tag, plain, AesGcmMagicHeader);
                             }
-                        }
 
-                        File.WriteAllBytes(destination, plain);
-                    }
-                    finally
-                    {
-                        CryptographicOperations.ZeroMemory(plain);
-                    }
-                }
-                else if (header.SequenceEqual(LegacyMagicHeader))
-                {
-                    // Legacy AEGISQ1 restore: write to temp file + verify SHA-256 BEFORE atomic replace!
-                    var tmpDest = destination + $".restore_{Guid.NewGuid():N}.tmp";
-                    try
-                    {
-                        using var incHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                        using (var output = new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                            if (!string.IsNullOrWhiteSpace(entry.Sha256))
+                            {
+                                var actualSha = Convert.ToHexString(SHA256.HashData(plain));
+                                if (!actualSha.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "복호화 데이터 SHA-256 무결성 검증에 실패했습니다.");
+                                }
+                            }
+
+                            WriteRestoreTempFile(tmpDest, plain);
+                        }
+                        finally
                         {
+                            CryptographicOperations.ZeroMemory(plain);
+                        }
+                    }
+                    else if (header.SequenceEqual(LegacyMagicHeader))
+                    {
+                        if (_writeRestoreTempOverride is not null)
+                        {
+                            using var ms = new MemoryStream();
                             var buffer = new byte[65536];
                             int bytesRead;
                             long offset = 0;
@@ -359,42 +487,140 @@ public sealed class QuarantineManager
                                 {
                                     buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
                                 }
-                                incHash.AppendData(buffer, 0, bytesRead);
+                                ms.Write(buffer, 0, bytesRead);
+                                offset += bytesRead;
+                            }
+                            var decrypted = ms.ToArray();
+                            try
+                            {
+                                WriteRestoreTempFile(tmpDest, decrypted);
+                            }
+                            finally
+                            {
+                                CryptographicOperations.ZeroMemory(decrypted);
+                            }
+                        }
+                        else
+                        {
+                            using var output = new FileStream(tmpDest, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                            var buffer = new byte[65536];
+                            int bytesRead;
+                            long offset = 0;
+                            while ((bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                for (int i = 0; i < bytesRead; i++)
+                                {
+                                    buffer[i] ^= LegacyObfuscationKey[(offset + i) % LegacyObfuscationKey.Length];
+                                }
                                 output.Write(buffer, 0, bytesRead);
                                 offset += bytesRead;
                             }
+                            output.Flush(flushToDisk: true);
                         }
-
-                        if (!string.IsNullOrWhiteSpace(entry.Sha256))
-                        {
-                            var actualSha = Convert.ToHexString(incHash.GetHashAndReset());
-                            if (!actualSha.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
-                            {
-                                return false;
-                            }
-                        }
-
-                        File.Move(tmpDest, destination, overwrite: true);
                     }
-                    finally
+                    else
                     {
-                        try { if (File.Exists(tmpDest)) File.Delete(tmpDest); } catch { }
+                        return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "지원되지 않는 격리 파일 형식입니다.");
                     }
+                }
+
+                // Re-verify SHA-256 directly on the flushed temp file BEFORE replacing destination.
+                if (!File.Exists(tmpDest))
+                {
+                    return new QuarantineRestoreResult(QuarantineRestoreStatus.WriteFailed, destination, "임시 복원 파일 생성에 실패했습니다.");
+                }
+
+                if (!string.IsNullOrWhiteSpace(entry.Sha256))
+                {
+                    using var verifyStream = new FileStream(tmpDest, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var diskSha = Convert.ToHexString(SHA256.HashData(verifyStream));
+                    if (!diskSha.Equals(entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, "디스크 임시 복원 파일의 SHA-256 검증에 실패했습니다.");
+                    }
+                }
+
+                // Commit atomically into destination: existing file is never partially overwritten on temp write failure!
+                if (overwriteExisting && File.Exists(destination))
+                {
+                    if ((File.GetAttributes(destination) & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return new QuarantineRestoreResult(QuarantineRestoreStatus.NotFoundOrInvalid, destination, "복원 대상 경로가 심볼릭 링크/리파스 포인트로 변경되었습니다.");
+                    }
+                    try { File.SetAttributes(destination, FileAttributes.Normal); } catch { }
+                    File.Replace(tmpDest, destination, destinationBackupFileName: null, ignoreMetadataErrors: true);
+                    TryFlushDirectoryMetadata(destDir);
                 }
                 else
                 {
-                    return false;
+                    try
+                    {
+                        File.Move(tmpDest, destination, overwrite: false);
+                        TryFlushDirectoryMetadata(destDir);
+                    }
+                    catch (IOException) when (!overwriteExisting && File.Exists(destination))
+                    {
+                        return new QuarantineRestoreResult(
+                            QuarantineRestoreStatus.DestinationConflict,
+                            destination,
+                            $"복원 대상 위치에 파일이 이미 존재합니다: {destination}");
+                    }
                 }
+            }
+            finally
+            {
+                try { if (File.Exists(tmpDest)) File.Delete(tmpDest); } catch { }
             }
 
             TryCancelPendingRebootDelete(destination);
             DeletePermanently(entryId);
-            return true;
+            return new QuarantineRestoreResult(QuarantineRestoreStatus.Restored, destination, $"복원 완료: {destination}");
         }
-        catch
+        catch (CryptographicException ex)
         {
-            return false;
+            return new QuarantineRestoreResult(QuarantineRestoreStatus.IntegrityCheckFailed, destination, $"복호화/무결성 검증 실패: {ex.Message}");
         }
+        catch (Exception ex)
+        {
+            return new QuarantineRestoreResult(QuarantineRestoreStatus.WriteFailed, destination, $"파일 쓰기/복원 실패: {ex.Message}");
+        }
+    }
+
+    private void WriteRestoreTempFile(string tempPath, byte[] plain)
+    {
+        if (_writeRestoreTempOverride is not null)
+        {
+            _writeRestoreTempOverride(tempPath, plain);
+            return;
+        }
+
+        using var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        output.Write(plain, 0, plain.Length);
+        output.Flush(flushToDisk: true);
+    }
+
+    private static bool IsPendingRebootDeleteScheduled(string filePath)
+    {
+        try
+        {
+            var full = Path.GetFullPath(filePath);
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\Session Manager", writable: false);
+            if (key?.GetValue("PendingFileRenameOperations") is not string[] ops || ops.Length < 1) return false;
+
+            var targetNt = @"\??\" + full;
+            for (int i = 0; i < ops.Length; i += 2)
+            {
+                var src = ops[i];
+                var dst = i + 1 < ops.Length ? ops[i + 1] : string.Empty;
+                if (string.IsNullOrEmpty(dst) && src.Equals(targetNt, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        catch { }
+        return false;
     }
 
     private static void TryCancelPendingRebootDelete(string filePath)
@@ -483,6 +709,43 @@ public sealed class QuarantineManager
                 var entry = JsonSerializer.Deserialize<QuarantineEntry>(File.ReadAllText(metaFile));
                 if (entry is not null)
                 {
+                    if (entry.Disposition == QuarantineDisposition.PendingOriginalRemoval)
+                    {
+                        // Crash-recovery reconciliation: inspect actual disk & OS reboot-delete queue state.
+                        bool originalStillPresent = !string.IsNullOrWhiteSpace(entry.OriginalPath) && File.Exists(entry.OriginalPath);
+                        if (!originalStillPresent)
+                        {
+                            entry = entry with
+                            {
+                                Disposition = QuarantineDisposition.RemovedImmediately
+                            };
+                        }
+                        else if (IsPendingRebootDeleteScheduled(entry.OriginalPath))
+                        {
+                            entry = entry with
+                            {
+                                Disposition = QuarantineDisposition.ScheduledDeleteOnReboot,
+                                Reason = entry.Reason.Contains("재부팅", StringComparison.Ordinal)
+                                    ? entry.Reason
+                                    : $"{entry.Reason} [중단 복구 확인 — 재부팅 시 OS 자동 삭제 예약됨]"
+                            };
+                        }
+                        else
+                        {
+                            entry = entry with
+                            {
+                                Disposition = QuarantineDisposition.CopyOnlyOriginalLocked,
+                                Reason = entry.Reason.Contains("중단 복구", StringComparison.Ordinal)
+                                    ? entry.Reason
+                                    : $"{entry.Reason} [중단 복구 확인 — 원본 파일 잔존]"
+                            };
+                        }
+                        try
+                        {
+                            WriteMetadataAtomic(metaFile, JsonSerializer.Serialize(entry, JsonOptions));
+                        }
+                        catch { }
+                    }
                     list.Add(entry);
                 }
             }

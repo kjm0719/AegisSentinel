@@ -1242,8 +1242,17 @@ public partial class MainWindow : Window
     private void OnResumeSelectedEventClick(object sender, RoutedEventArgs e)
     {
         if (EventsListView.SelectedItem is not SecurityEventRow row) return;
-        _orchestrator.AllowAndResumeProcess(row.Source, addToWhitelist: true);
+        var res = _orchestrator.AllowAndResumeProcessDetailed(row.Source, addToWhitelist: true);
         RefreshAfterIntervention();
+        if (res.HasAnyPendingRetry)
+        {
+            FooterMessageText.Text = row.Source.ContainmentDetail;
+            System.Windows.MessageBox.Show(
+                $"일부 프로세스 재개에 실패하여 동결 추적이 유지되었습니다.\n{row.Source.ContainmentDetail}",
+                "부분 재개 (재시도 필요)",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
     }
 
     private void OnClearEventsClick(object sender, RoutedEventArgs e)
@@ -1540,19 +1549,59 @@ public partial class MainWindow : Window
 
     private void OnRefreshQuarantineClick(object sender, RoutedEventArgs e) => RefreshQuarantineList();
 
+    internal static QuarantineRestoreResult ExecuteRestoreWithConflictConfirmation(
+        QuarantineManager quarantine,
+        string entryId,
+        Func<string, bool> confirmOverwrite)
+    {
+        var res = quarantine.RestoreFileDetailed(entryId, overwriteExisting: false);
+        if (res.Status == QuarantineRestoreStatus.DestinationConflict && confirmOverwrite(res.DestinationPath))
+        {
+            res = quarantine.RestoreFileDetailed(entryId, overwriteExisting: true);
+        }
+        return res;
+    }
+
     private void OnRestoreQuarantineClick(object sender, RoutedEventArgs e)
     {
         if (QuarantineListView.SelectedItem is not QuarantineRow row) return;
         try
         {
-            if (_orchestrator.Quarantine.RestoreFile(row.Source.Id))
+            bool userDeclinedConflict = false;
+            var res = ExecuteRestoreWithConflictConfirmation(
+                _orchestrator.Quarantine,
+                row.Source.Id,
+                destPath =>
+                {
+                    var confirm = System.Windows.MessageBox.Show(
+                        $"복원 대상 경로에 이미 파일이 존재합니다:\n{destPath}\n\n" +
+                        "기존 파일을 덮어쓰고 격리된 원본으로 교체할까요?\n" +
+                        "('아니오'를 선택하면 기존 파일과 격리 사본이 모두 안전하게 유지됩니다.)",
+                        "격리 파일 복원 충돌 확인",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+                    if (confirm != MessageBoxResult.Yes)
+                    {
+                        userDeclinedConflict = true;
+                        return false;
+                    }
+                    return true;
+                });
+
+            if (userDeclinedConflict)
+            {
+                FooterMessageText.Text = "복원 취소됨: 대상 경로의 기존 파일과 격리 사본을 보존했습니다.";
+                return;
+            }
+
+            if (res.Success)
             {
                 FooterMessageText.Text = $"복원 완료: {row.OriginalPath}";
                 RefreshQuarantineList();
             }
             else
             {
-                System.Windows.MessageBox.Show("격리 파일 복원 실패: 대상 위치가 잠겨 있거나 파일이 없습니다.", "격리소 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
+                System.Windows.MessageBox.Show($"격리 파일 복원 실패: {res.Message}", "격리소 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
         catch (Exception ex)

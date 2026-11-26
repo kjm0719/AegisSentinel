@@ -37,22 +37,77 @@ public enum ThreatCategory
 
 public enum SecurityActionTaken
 {
-    Logged,
-    Suspended,
-    Terminated,
-    Quarantined,
-    QuarantinePendingReboot,
-    QuarantineCopyOnly,
-    FirewallBlocked,
-    RolledBack,
-    Allowed
+    Logged = 0,
+    Suspended = 1,
+    Terminated = 2,
+    Quarantined = 3,
+    FirewallBlocked = 4,
+    RolledBack = 5,
+    Allowed = 6,
+    QuarantinePendingReboot = 7,
+    QuarantineCopyOnly = 8,
+    PartiallyAllowed = 9
 }
 
 public enum QuarantineDisposition
 {
-    RemovedImmediately,
-    ScheduledDeleteOnReboot,
-    CopyOnlyOriginalLocked
+    RemovedImmediately = 0,
+    ScheduledDeleteOnReboot = 1,
+    CopyOnlyOriginalLocked = 2,
+    PendingOriginalRemoval = 3
+}
+
+public enum QuarantineRestoreStatus
+{
+    Restored,
+    DestinationConflict,
+    IntegrityCheckFailed,
+    NotFoundOrInvalid,
+    WriteFailed
+}
+
+public sealed record QuarantineRestoreResult(
+    QuarantineRestoreStatus Status,
+    string DestinationPath,
+    string Message)
+{
+    public bool Success => Status == QuarantineRestoreStatus.Restored;
+}
+
+public sealed record ProcessInstanceIdentity(
+    int ProcessId,
+    long CreationTimeFileTimeUtc,
+    string ExecutablePath = "");
+
+public enum ProcessResumeStatus
+{
+    Resumed,
+    AlreadyExitedOrReplaced,
+    TransientFailureRetryRequired
+}
+
+public sealed record ProcessResumeItemResult(
+    int ProcessId,
+    ProcessResumeStatus Status,
+    string Detail = "");
+
+public sealed record ProcessTreeResumeResult(
+    int RootPid,
+    ProcessResumeStatus? RootStatus,
+    IReadOnlyList<ProcessResumeItemResult> ChildResults)
+{
+    public IReadOnlyList<int> RemainingSuspendedChildPids =>
+        ChildResults
+            .Where(r => r.Status == ProcessResumeStatus.TransientFailureRetryRequired)
+            .Select(r => r.ProcessId)
+            .ToList();
+
+    public bool RootStillSuspended => RootStatus == ProcessResumeStatus.TransientFailureRetryRequired;
+    public bool HasAnyPendingRetry => RootStillSuspended || RemainingSuspendedChildPids.Count > 0;
+    public bool AnyResumed =>
+        RootStatus == ProcessResumeStatus.Resumed ||
+        ChildResults.Any(r => r.Status == ProcessResumeStatus.Resumed);
+    public bool AllCleared => !HasAnyPendingRetry;
 }
 
 public enum SignatureStatus
@@ -94,6 +149,9 @@ public sealed record SignatureInfo(
 
 public sealed class SecurityEvent
 {
+    public const int CurrentSchemaVersion = 2;
+
+    public int SchemaVersion { get; set; }
     public string Id { get; init; } = Guid.NewGuid().ToString("N")[..12];
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.Now;
     public ThreatSeverity Severity { get; set; }
@@ -104,6 +162,7 @@ public sealed class SecurityEvent
     public string MitreTechniqueId { get; set; } = string.Empty;
     public string MitreTactic { get; set; } = string.Empty;
     public int ProcessId { get; init; }
+    public long ProcessCreationTimeFileTimeUtc { get; set; }
     public string ProcessName { get; init; } = string.Empty;
     public string ProcessPath { get; set; } = string.Empty;
     public int ParentProcessId { get; init; }
@@ -118,12 +177,15 @@ public sealed class SecurityEvent
     public SignatureInfo? Signature { get; set; }
     public bool IsProcessSuspended { get; set; }
     public List<int> SuspendedChildProcessIds { get; set; } = new();
+    public List<ProcessInstanceIdentity> SuspendedChildInstances { get; set; } = new();
     public int AttemptedChildFreezeCount { get; set; }
     public bool? ProcessTerminationSucceeded { get; set; }
     public QuarantineDisposition? QuarantineDisposition { get; set; }
     public string ContainmentDetail { get; set; } = string.Empty;
     public bool IsRiskAlreadyCorrelated { get; set; }
-    public bool CanIntervene => ProcessId > 4 && (IsProcessSuspended || SuspendedChildProcessIds.Count > 0 || !string.IsNullOrEmpty(TargetPath) || !string.IsNullOrEmpty(ProcessPath));
+    public bool HasAnySuspendedProcess =>
+        IsProcessSuspended || SuspendedChildProcessIds.Count > 0 || SuspendedChildInstances.Count > 0;
+    public bool CanIntervene => ProcessId > 4 && (HasAnySuspendedProcess || !string.IsNullOrEmpty(TargetPath) || !string.IsNullOrEmpty(ProcessPath));
 
     public void EnsureMitrePopulated()
     {

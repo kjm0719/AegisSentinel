@@ -30,6 +30,7 @@ public sealed class AuditLogService
         try
         {
             evt.EnsureMitrePopulated();
+            evt.SchemaVersion = SecurityEvent.CurrentSchemaVersion;
             var logPath = Path.Combine(LogsDirectory, $"events-{DateTime.Now:yyyyMMdd}.jsonl");
             var line = JsonSerializer.Serialize(evt, JsonOptions) + Environment.NewLine;
             lock (_sync)
