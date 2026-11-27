@@ -7,7 +7,7 @@
 [![.NET 10](https://img.shields.io/badge/.NET-10.0--windows-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
 [![운영체제](https://img.shields.io/badge/운영체제-Windows%2010%2F11%20(x64)-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-40개%20기법%20%7C%2011개%20전술-E11D48)](docs/MITRE_ATTACK_COVERAGE.md)
-[![테스트](https://img.shields.io/badge/자동화%20테스트-66%2F66%20통과-22C55E)](tests/AegisSentinel.Tests/QuarantineChunkedAeadRegressionTests.cs)
+[![테스트](https://img.shields.io/badge/자동화%20테스트-80%2F80%20통과-22C55E)](tests/AegisSentinel.Tests/ManualRemediationAndFailoverRegressionTests.cs)
 [![라이선스: MIT](https://img.shields.io/badge/라이선스-MIT-F59E0B.svg)](LICENSE)
 
 > **프로젝트 문서**: [변경 이력 (CHANGELOG)](CHANGELOG.md) · [정량 벤치마크 (BENCHMARKS)](docs/BENCHMARKS.md) · [보안 정책 (SECURITY)](SECURITY.md) · [기여 가이드 (CONTRIBUTING)](CONTRIBUTING.md) · [아키텍처](docs/ARCHITECTURE.md) · [위협 모델](docs/THREAT_MODEL.md)

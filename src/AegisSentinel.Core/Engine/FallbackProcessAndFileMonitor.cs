@@ -16,15 +16,29 @@ public sealed class FallbackProcessAndFileMonitor : IDisposable
     private readonly RansomwareDetector _ransomwareDetector;
     private readonly CanaryManager _canaryManager;
     private readonly Func<GuardPolicy> _policyProvider;
+    private readonly Func<IReadOnlyList<(int Pid, string Name)>>? _processSnapshotProvider;
+    private readonly TimeSpan _pollInterval;
 
-    private readonly HashSet<int> _knownPids = new();
+    private readonly Dictionary<int, long> _knownProcesses = new();
     private readonly List<FileSystemWatcher> _folderWatchers = new();
     private readonly object _sync = new();
     private Timer? _processTimer;
     private int _isPolling;
     private volatile bool _skipProcessScan;
 
+    public bool IsProcessPollingActive
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return !_skipProcessScan && _processTimer is not null;
+            }
+        }
+    }
+
     public event Action<SecurityEvent>? ThreatDetected;
+    public event Action<int, string, string>? NewProcessObserved;
 
     public FallbackProcessAndFileMonitor(
         ProcessController processController,
@@ -32,7 +46,9 @@ public sealed class FallbackProcessAndFileMonitor : IDisposable
         ProcessRuleEvaluator processEvaluator,
         RansomwareDetector ransomwareDetector,
         CanaryManager canaryManager,
-        Func<GuardPolicy> policyProvider)
+        Func<GuardPolicy> policyProvider,
+        Func<IReadOnlyList<(int Pid, string Name)>>? processSnapshotProvider = null,
+        TimeSpan? pollInterval = null)
     {
         _processController = processController;
         _signatureVerifier = signatureVerifier;
@@ -40,48 +56,122 @@ public sealed class FallbackProcessAndFileMonitor : IDisposable
         _ransomwareDetector = ransomwareDetector;
         _canaryManager = canaryManager;
         _policyProvider = policyProvider;
+        _processSnapshotProvider = processSnapshotProvider;
+        _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
     }
 
     public void Start(bool processMonitoringHandledByEtw)
     {
         Stop();
-        _skipProcessScan = processMonitoringHandledByEtw;
-
-        if (!_skipProcessScan)
-        {
-            lock (_sync)
-            {
-                foreach (var p in Process.GetProcesses())
-                {
-                    _knownPids.Add(p.Id);
-                    p.Dispose();
-                }
-            }
-
-            _processTimer = new Timer(_ => PollNewProcesses(), null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
-        }
+        SetProcessPollingEnabled(!processMonitoringHandledByEtw);
 
         // Always keep FileSystemWatcher active on ProtectedFolders as a safety net for Canary tampering
         // even when ETW is running (in case a file handle was opened prior to ETW session start).
         SetupFolderWatchers();
     }
 
-    public void Stop()
+    /// <summary>
+    /// Dynamically enables or disables fallback process polling without tearing down active folder watchers.
+    /// Used for live failover when ETW kernel telemetry drops mid-run and clean restoration when ETW recovers.
+    /// </summary>
+    public void SetProcessPollingEnabled(bool enabled)
     {
-        _skipProcessScan = true;
-        _processTimer?.Dispose();
-        _processTimer = null;
-
         lock (_sync)
         {
+            if (enabled)
+            {
+                if (!_skipProcessScan && _processTimer is not null)
+                {
+                    return;
+                }
+
+                _knownProcesses.Clear();
+                foreach (var (pid, _, creationTimeUtc) in CaptureProcessSnapshot())
+                {
+                    _knownProcesses[pid] = creationTimeUtc;
+                }
+
+                _skipProcessScan = false;
+                _processTimer?.Dispose();
+                _processTimer = new Timer(_ => PollNewProcesses(), null, _pollInterval, _pollInterval);
+            }
+            else
+            {
+                _skipProcessScan = true;
+                _processTimer?.Dispose();
+                _processTimer = null;
+                _knownProcesses.Clear();
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        lock (_sync)
+        {
+            _skipProcessScan = true;
+            _processTimer?.Dispose();
+            _processTimer = null;
+
             foreach (var watcher in _folderWatchers)
             {
                 watcher.EnableRaisingEvents = false;
                 watcher.Dispose();
             }
             _folderWatchers.Clear();
-            _knownPids.Clear();
+            _knownProcesses.Clear();
         }
+    }
+
+    public void PollNewProcessesOnce() => PollNewProcesses();
+
+    private IReadOnlyList<(int Pid, string Name, long CreationTimeFileTimeUtc)> CaptureProcessSnapshot()
+    {
+        if (_processSnapshotProvider is not null)
+        {
+            var raw = _processSnapshotProvider();
+            var enriched = new List<(int Pid, string Name, long CreationTimeFileTimeUtc)>(raw.Count);
+            foreach (var (pid, name) in raw)
+            {
+                long creationTimeUtc = _processController.TryGetProcessInstanceIdentity(pid, out var identity) && identity is not null
+                    ? identity.CreationTimeFileTimeUtc
+                    : 0;
+                enriched.Add((pid, name, creationTimeUtc));
+            }
+            return enriched;
+        }
+
+        var result = new List<(int Pid, string Name, long CreationTimeFileTimeUtc)>();
+        var currentProcesses = Process.GetProcesses();
+        foreach (var proc in currentProcesses)
+        {
+            try
+            {
+                long creationTimeUtc = 0;
+                if (proc.Id > 4 &&
+                    _processController.TryGetProcessInstanceIdentity(proc.Id, out var identity) &&
+                    identity is not null &&
+                    identity.CreationTimeFileTimeUtc > 0)
+                {
+                    creationTimeUtc = identity.CreationTimeFileTimeUtc;
+                }
+                else if (proc.Id > 4)
+                {
+                    try { creationTimeUtc = proc.StartTime.ToUniversalTime().ToFileTimeUtc(); } catch { }
+                }
+
+                result.Add((proc.Id, proc.ProcessName, creationTimeUtc));
+            }
+            catch
+            {
+                // Ignore exited processes.
+            }
+            finally
+            {
+                proc.Dispose();
+            }
+        }
+        return result;
     }
 
     private void SetupFolderWatchers()
@@ -175,46 +265,61 @@ public sealed class FallbackProcessAndFileMonitor : IDisposable
         try
         {
             var policy = _policyProvider();
-            var currentProcesses = Process.GetProcesses();
+            var currentProcesses = CaptureProcessSnapshot();
             var alive = new HashSet<int>();
             var newProcs = new List<(int Id, string Name)>();
+            var recycledPids = new List<int>();
 
-            foreach (var proc in currentProcesses)
+            foreach (var (procId, procName, creationTimeUtc) in currentProcesses)
             {
-                try
+                alive.Add(procId);
+                bool isNew = false;
+                bool isRecycled = false;
+                lock (_sync)
                 {
-                    alive.Add(proc.Id);
-                    bool isNew;
-                    lock (_sync)
+                    if (!_knownProcesses.TryGetValue(procId, out long prevCreationTime))
                     {
-                        isNew = _knownPids.Add(proc.Id);
+                        _knownProcesses[procId] = creationTimeUtc;
+                        isNew = true;
                     }
-                    if (isNew &&
-                        proc.Id > 4 &&
-                        proc.Id != Environment.ProcessId &&
-                        !InternalHelperProcessRegistry.IsInternalHelper(proc.Id))
+                    else if (prevCreationTime > 0 && creationTimeUtc > 0 && prevCreationTime != creationTimeUtc)
                     {
-                        newProcs.Add((proc.Id, proc.ProcessName));
+                        // Same PID reused by a brand-new process instance between consecutive polls!
+                        _knownProcesses[procId] = creationTimeUtc;
+                        isNew = true;
+                        isRecycled = true;
+                    }
+                    else if (prevCreationTime == 0 && creationTimeUtc > 0)
+                    {
+                        _knownProcesses[procId] = creationTimeUtc;
                     }
                 }
-                catch
+
+                if (isRecycled)
                 {
-                    // Ignore exited processes.
+                    recycledPids.Add(procId);
                 }
-                finally
+
+                if (isNew &&
+                    procId > 4 &&
+                    procId != Environment.ProcessId &&
+                    !InternalHelperProcessRegistry.IsInternalHelper(procId))
                 {
-                    proc.Dispose();
+                    newProcs.Add((procId, procName));
                 }
             }
 
             List<int> exitedPids;
             lock (_sync)
             {
-                exitedPids = _knownPids.Where(id => !alive.Contains(id)).ToList();
-                _knownPids.IntersectWith(alive);
+                exitedPids = _knownProcesses.Keys.Where(id => !alive.Contains(id)).ToList();
+                foreach (var id in exitedPids)
+                {
+                    _knownProcesses.Remove(id);
+                }
             }
 
-            foreach (var deadPid in exitedPids)
+            foreach (var deadPid in exitedPids.Concat(recycledPids))
             {
                 _ransomwareDetector.ClearProcess(deadPid);
             }
@@ -238,7 +343,10 @@ public sealed class FallbackProcessAndFileMonitor : IDisposable
     private void InspectNewProcess(int pid, string procName, GuardPolicy policy)
     {
         var procPath = _processController.GetExecutablePath(pid);
-        var (parentPid, cmdLine) = _processController.GetWmiProcessMetadata(pid);
+        NewProcessObserved?.Invoke(pid, procName, procPath);
+        var (parentPid, cmdLine) = _processSnapshotProvider is null
+            ? _processController.GetWmiProcessMetadata(pid)
+            : (0, string.Empty);
         var parentPath = parentPid > 4 ? _processController.GetExecutablePath(parentPid) : string.Empty;
         var parentName = parentPid > 4
             ? (!string.IsNullOrEmpty(parentPath) ? Path.GetFileNameWithoutExtension(parentPath) : _processController.GetProcessNameSafe(parentPid))

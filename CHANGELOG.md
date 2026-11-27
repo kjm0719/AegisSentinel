@@ -9,6 +9,22 @@
 
 ---
 
+## [1.2.2] - 2026-11-27
+
+### 수정 (Fixed)
+- **수동 치료(‘종료 및 격리’) PID 재사용 오종료·경로 기반 재종료 제거·미존재 파일 오격리 차단 (`P1`, `MalwareScanModels` · `MzkDeepScanner` · `DllSideloadingDetector` · `ProcessController` · `QuarantineManager` · `MalwareRemediationService`)**: 스캔 결과(`MalwareThreatItem`)에 `ProcessCreationTimeFileTimeUtc`·`HostProcessPath`·`TargetFileExistedAtScan`·`Sha256`을 함께 보존하고, 수동 종료 대상을 검사 시 기록한 단일 프로세스 인스턴스로 한정(`CureQuarantineFile`·`QuarantineAssociatedFile`의 경로 기반 프로세스 일괄 종료 제거). 생성 시각이 미확인(`<= 0`)이면 `HostProcessPath`가 일치해도 종료를 보류하고, 디스크 원본이 없었던 고스팅 프로세스(`TargetFileExistedAtScan == false`)는 종료 성공만 기록하고 이후 생성된 새 파일을 격리하지 않고 보존. `AlreadyExitedOrReplaced` 이후 격리는 검사 시점 `Sha256`과 `QuarantineManager.QuarantineFile(..., expectedSha256)` 단일 스냅샷 해시가 일치할 때만 진행.
+- **서비스·예약 작업·자동 실행 연계 파일 해시 검증 (`P1`, `MalwareScanModels` · `MzkDeepScanner` · `BrowserAndPupCleaner` · `MalwareRemediationService`)**: `MalwareThreatItem.AssociatedFileSha256`에 검사 시점 연계 파일 해시를 별도 저장하고, `QuarantineAssociatedFile()`에서 경로 기반 프로세스 종료를 제거하며 해시 누락·불일치 시 파일을 보존하고 이미 수행한 서비스/예약 작업 조치와 연계 파일 격리 보류를 분리 보고.
+- **실행 중 ETW 커널 수집기 중단 시 보조 폴링 전환·재사용 PID 감지·복구 (`P1`/`P2`, `SecurityModels` · `EtwKernelTelemetryService` · `FallbackProcessAndFileMonitor` · `NetworkGuardMonitor` · `SecurityOrchestrator` · `MainWindow`)**: `TelemetryHealthState` 상태 머신과 `SessionStoppedUnexpectedly`로 제한 모드 보조 폴링 자동 전환 및 `TryRecoverEtwKernelTelemetry()` 복구 지원. `FallbackProcessAndFileMonitor`가 `_knownProcesses(PID -> CreationTimeFileTimeUtc)`를 비교해 연속 폴링 사이 같은 PID로 재사용된 새 프로세스도 정확히 1회 감지.
+- **브라우저 바로가기 정밀 인자 복구 및 실패 시 원본 보존 (`P2`, `MalwareRemediationService`)**: `SanitizeBrowserShortcutArguments()`로 `--profile-directory` 등 정상 인자를 보존하면서 식별된 위험 플래그(`--load-extension`, `--remote-debugging-port`, `--proxy-server`, `--proxy-pac-url`, `--disable-web-security`, `--disable-extensions-except`)와 비신뢰 외부 URL만 정밀 제거. 백업·읽기·저장 실패 시 격리 경로로 떨어지지 않고 실패 결과 반환 및 원본 바로가기 보존.
+- **악성 서비스 치료 결과 3축 분리 보고 및 연계 파일 상태 정확화 (`P2`, `MalwareScanModels` · `MalwareRemediationService`)**: `CureDisableService()`가 `sc.exe stop` 반환값(이미 중지 상태 `1062` 구분), `sc.exe config start= disabled` 결과, 연계 파일의 실제 `QuarantineDisposition`을 `RemediationItemResult`와 메시지에 각각 분리 보고하도록 수정. 중지 실패·사본만 보관(`CopyOnlyOriginalLocked`) 상태에서 `"중지 및 비활성화 완료"` 또는 `"연계 파일 격리 완료"`로 오표시하지 않도록 `CureRollbackPersistence()`·`CureDeleteScheduledTask()`까지 공통 정리.
+- **수동 치료 감사 로그 `SecurityActionTaken` 정확 기록 (`P2`, `MalwareRemediationService`)**: 모든 치료 성공을 `SecurityActionTaken.Quarantined`로 일괄 기록하던 로직을 제거하고, HOSTS/프록시/Defender 예외/브라우저 설정/ADS/지속성 롤백은 `RolledBack`, 메모리 고스팅 종료는 `Terminated`, 파일 격리는 실제 `QuarantineDisposition`에 맞춰 `Quarantined` / `QuarantinePendingReboot` / `QuarantineCopyOnly`로 기록(기존 Enum 번호 `0..9` 100% 유지).
+- **잠금 원본 파일의 경로 기반 재부팅 삭제 예약 제거 (`QuarantineManager` · `MalwareRemediationService`)**: 기존 로컬 개선 사항을 유지해 잠긴 원본은 재부팅 시 교체 파일이 삭제될 위험을 원천 차단하고 `CopyOnlyOriginalLocked`로 보존하며, 시작폴더 지속성 항목은 단일 격리 경로로 처리.
+
+### 테스트 (Tests)
+- `ManualRemediationAndFailoverRegressionTests` 11종 추가 (재사용 PID·DLL 미로드·생성 시각 조회 실패 오종료 0회, 생성 시각 0 + 동일 호스트 경로 종료 보류, `AlreadyExitedOrReplaced` 이후 SHA-256 불일치/누락 격리 차단 및 동일 EXE 새 인스턴스 오종료 0회, 디스크 미존재 고스팅 종료 후 신규 파일 보존, 서비스/예약 작업 연계 파일 변경·미해시 보존 및 분리 보고, 보조 감시 연속 폴링 PID 재사용 1회 감지, 브라우저 바로가기 정상 프로필 인자 보존 및 백업/저장 실패 시 원본 보존, ETW 중단→제한 모드→복구, 서비스 3축 보고, HOSTS `RolledBack` 감사 기록 + Enum `0..9` 보존 — 전체 **80 / 80 통과**).
+
+---
+
 ## [1.2.1] - 2026-11-27
 
 ### 수정 (Fixed)
@@ -99,7 +115,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.1...v1.1.2

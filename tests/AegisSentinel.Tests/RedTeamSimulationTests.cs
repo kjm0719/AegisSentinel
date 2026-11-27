@@ -2111,7 +2111,7 @@ public sealed class RedTeamSimulationTests : IDisposable
         Assert.Equal(SecurityActionTaken.QuarantineCopyOnly, copyEvt.ActionTaken);
         Assert.True(File.Exists(lockedFile), "Original locked file remains on disk as simulated");
 
-        // Reboot-scheduled deletion reports QuarantinePendingReboot distinctly from immediate removal
+        // Even an available reboot scheduler must never delete a future occupant of this path
         var rebootQm = new QuarantineManager(
             prDir,
             deleteFileOverride: _ => false,
@@ -2126,9 +2126,9 @@ public sealed class RedTeamSimulationTests : IDisposable
             Title = "Locked Malware Reboot-Scheduled Test"
         };
         bool rebootOk = rebootOrch.KillAndQuarantine(rebootEvt);
-        Assert.True(rebootOk);
-        Assert.Equal(QuarantineDisposition.ScheduledDeleteOnReboot, rebootEvt.QuarantineDisposition);
-        Assert.Equal(SecurityActionTaken.QuarantinePendingReboot, rebootEvt.ActionTaken);
+        Assert.False(rebootOk);
+        Assert.Equal(QuarantineDisposition.CopyOnlyOriginalLocked, rebootEvt.QuarantineDisposition);
+        Assert.Equal(SecurityActionTaken.QuarantineCopyOnly, rebootEvt.ActionTaken);
 
         // 2. Partial process-tree freeze: root fails (77100), child1 succeeds (77101), child2 fails (77102).
         //    Root event MUST NOT claim IsProcessSuspended=true, and unfrozen child2 MUST NOT be blinded in _activeInterventionPids!

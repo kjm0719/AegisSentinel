@@ -126,12 +126,31 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
             return hashes;
         }
 
+        static byte[] ReadFileBytesShared(string path)
+        {
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                try
+                {
+                    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    using var ms = new MemoryStream();
+                    fs.CopyTo(ms);
+                    return ms.ToArray();
+                }
+                catch (IOException) when (attempt < 19)
+                {
+                    Thread.Sleep(50);
+                }
+            }
+            return File.ReadAllBytes(path);
+        }
+
         static int CountModifiedDocs(Dictionary<string, string> originalHashes)
         {
             int modified = 0;
             foreach (var kvp in originalHashes)
             {
-                var current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                var current = Convert.ToHexString(SHA256.HashData(ReadFileBytesShared(kvp.Key)));
                 if (!current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
                 {
                     modified++;
@@ -234,7 +253,16 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
             Assert.False(procB.HasExited, "Frozen child process should still be suspended in memory, not exited!");
 
             // Kill frozen mutator before measuring final protected state and restoring from RecoveryVault
-            try { procB.Kill(entireProcessTree: true); procB.WaitForExit(3000); } catch { }
+            try
+            {
+                if (!procB.HasExited) procB.Kill(entireProcessTree: true);
+                if (!procB.WaitForExit(5000))
+                {
+                    orchestrator.ProcessControl.TryTerminateProcess(procB.Id);
+                    procB.WaitForExit(3000);
+                }
+            }
+            catch { }
             orchestrator.Stop();
 
             protectedModifiedBeforeFreeze = CountModifiedDocs(protectedHashes);
@@ -245,11 +273,11 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
             var snapshots = orchestrator.Vault.ListSnapshots().ToDictionary(s => s.OriginalPath, StringComparer.OrdinalIgnoreCase);
             foreach (var kvp in protectedHashes)
             {
-                var current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                var current = Convert.ToHexString(SHA256.HashData(ReadFileBytesShared(kvp.Key)));
                 if (!current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
                 {
                     Assert.True(orchestrator.Vault.RestoreSnapshot(snapshots[kvp.Key].Id));
-                    current = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(kvp.Key)));
+                    current = Convert.ToHexString(SHA256.HashData(ReadFileBytesShared(kvp.Key)));
                 }
                 if (current.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase))
                 {
@@ -412,7 +440,7 @@ public sealed class RansomwareDefenseBenchmarkTests : IDisposable
             var f = Path.Combine(d, "e.exe");
             var orig = Encoding.UTF8.GetBytes("FAULT-5-REBOOT-CANCEL");
             File.WriteAllBytes(f, orig);
-            var qm1 = new QuarantineManager(d, deleteFileOverride: _ => false, scheduleRebootDeleteOverride: _ => true);
+            var qm1 = new QuarantineManager(d, deleteFileOverride: _ => false);
             var e = qm1.QuarantineFile(f, "F5");
             File.Delete(f);
             var qm2 = new QuarantineManager(d, cancelRebootDeleteOverride: _ => false, isRebootDeleteScheduledOverride: _ => true);

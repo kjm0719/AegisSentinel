@@ -19,6 +19,7 @@ public interface IProcessNativeOperations
     int SuspendProcess(IntPtr handle);
     int ResumeProcess(IntPtr handle);
     bool TerminateProcess(IntPtr handle, uint exitCode);
+    bool? IsModuleLoaded(int pid, IntPtr handle, string modulePath) => null;
 }
 
 internal sealed class Win32ProcessNativeOperations : IProcessNativeOperations
@@ -66,6 +67,44 @@ internal sealed class Win32ProcessNativeOperations : IProcessNativeOperations
     public int ResumeProcess(IntPtr handle) => NativeMethods.NtResumeProcess(handle);
 
     public bool TerminateProcess(IntPtr handle, uint exitCode) => NativeMethods.TerminateProcess(handle, exitCode);
+
+    public bool? IsModuleLoaded(int pid, IntPtr handle, string modulePath)
+    {
+        if (string.IsNullOrWhiteSpace(modulePath)) return false;
+        string normalizedTarget;
+        try { normalizedTarget = Path.GetFullPath(modulePath); }
+        catch { return false; }
+
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            foreach (ProcessModule module in proc.Modules)
+            using (module)
+            {
+                var modFile = module.FileName;
+                if (string.IsNullOrWhiteSpace(modFile)) continue;
+                try
+                {
+                    if (Path.GetFullPath(modFile).Equals(normalizedTarget, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    if (modFile.Equals(modulePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public sealed class ProcessController
@@ -620,7 +659,14 @@ public sealed class ProcessController
     public ProcessTerminationItemResult TryTerminateProcessInstanceDetailed(
         int pid,
         long expectedCreationTimeUtc,
-        string? expectedExecutablePath = null)
+        string? expectedExecutablePath = null) =>
+        TryTerminateProcessInstanceDetailed(pid, expectedCreationTimeUtc, expectedExecutablePath, requiredLoadedModulePath: null);
+
+    public ProcessTerminationItemResult TryTerminateProcessInstanceDetailed(
+        int pid,
+        long expectedCreationTimeUtc,
+        string? expectedExecutablePath,
+        string? requiredLoadedModulePath)
     {
         if (pid <= 4 || pid == Environment.ProcessId || InternalHelperProcessRegistry.IsInternalHelper(pid))
         {
@@ -729,6 +775,39 @@ public sealed class ProcessController
                     ProcessTerminationStatus.AlreadyExitedOrReplaced,
                     StillSuspendedByUs: false,
                     "PID 실행 경로가 불일치함");
+            }
+
+            if (!string.IsNullOrWhiteSpace(requiredLoadedModulePath))
+            {
+                bool? moduleLoaded = _nativeOps.IsModuleLoaded(pid, handle, requiredLoadedModulePath);
+                if (moduleLoaded == false)
+                {
+                    RemoveTrackedIfMatching(pid, expectedCreationTimeUtc);
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.AlreadyExitedOrReplaced,
+                        StillSuspendedByUs: false,
+                        "대상 DLL이 현재 프로세스에 로드되어 있지 않음");
+                }
+                if (moduleLoaded is null)
+                {
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.TransientFailureRetryRequired,
+                        IsProcessSuspendedByUs(pid),
+                        "프로세스 로드 모듈 확인 실패 — 신원 확인 불가로 종료 보류 (재검사 필요)");
+                }
+
+                // Re-verify creation time on the same open handle after module inspection to prevent TOCTOU.
+                if (expectedCreationTimeUtc != 0 &&
+                    VerifyHandleCreationTime(handle, expectedCreationTimeUtc) != InstanceIdentityMatch.Matched)
+                {
+                    return new ProcessTerminationItemResult(
+                        pid,
+                        ProcessTerminationStatus.TransientFailureRetryRequired,
+                        IsProcessSuspendedByUs(pid),
+                        "모듈 확인 직후 프로세스 신원 재검증 실패 — 종료 보류 (재검사 필요)");
+                }
             }
 
             bool terminated = _nativeOps.TerminateProcess(handle, 1);

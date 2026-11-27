@@ -458,6 +458,18 @@ public sealed class BrowserAndPupCleaner
                     var match = MatchPupRule(svcName, displayName, rules) ?? MatchPupRule(exeName, exeName, rules);
                     if (match is null) continue;
 
+                    var pupSvcAssoc = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null;
+                    string? pupSvcSha256 = null;
+                    if (pupSvcAssoc is not null)
+                    {
+                        try
+                        {
+                            using var fs = new FileStream(pupSvcAssoc, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                            pupSvcSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fs));
+                        }
+                        catch { }
+                    }
+
                     findings.Add(new MalwareThreatItem
                     {
                         Stage = MalwareScanStage.PersistenceAndService,
@@ -467,7 +479,8 @@ public sealed class BrowserAndPupCleaner
                         RiskScore = 82,
                         TargetPath = $@"HKLM\SYSTEM\CurrentControlSet\Services\{svcName}",
                         EntryName = svcName,
-                        AssociatedFilePath = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null,
+                        AssociatedFilePath = pupSvcAssoc,
+                        AssociatedFileSha256 = pupSvcSha256,
                         SignatureLabel = "Aegis PUP/그리드 룰 DB",
                         Description = $"PC 리소스/네트워크를 몰래 점유하는 그리드 딜리버리 서비스 감지: {svcName} ({match.Description})",
                         ActionType = RemediationActionType.DisableMaliciousService,

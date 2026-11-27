@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using AegisSentinel.Core.Models;
 using AegisSentinel.Core.Services;
 
@@ -140,10 +141,18 @@ public static class DllSideloadingDetector
         string hostExePath,
         SignatureInfo hostSignature,
         SignatureVerifier verifier,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        long hostCreationTimeFileTimeUtc = 0)
     {
         var results = new List<MalwareThreatItem>();
         if (!hostSignature.IsSigned || string.IsNullOrWhiteSpace(System32Dir)) return results;
+
+        long creationTimeUtc = hostCreationTimeFileTimeUtc;
+        if (creationTimeUtc == 0)
+        {
+            try { creationTimeUtc = proc.StartTime.ToUniversalTime().ToFileTimeUtc(); }
+            catch { }
+        }
 
         try
         {
@@ -189,6 +198,10 @@ public static class DllSideloadingDetector
                     TargetPath = modPath,
                     EntryName = $"{proc.ProcessName} (PID {proc.Id}) ← {dllName}",
                     ProcessId = proc.Id,
+                    ProcessCreationTimeFileTimeUtc = creationTimeUtc,
+                    HostProcessPath = hostExePath,
+                    TargetFileExistedAtScan = File.Exists(modPath),
+                    Sha256 = ComputeFileSha256Safe(modPath),
                     SignatureLabel = modSig.DisplayLabel,
                     Description = $"서명된 프로세스 '{Path.GetFileName(hostExePath)}'가 Windows\\System32 대신 외부 경로의 미서명 시스템명 DLL('{modPath}')을 로드했습니다!{(isKnownGameModFolder ? " (게임 모드 로더일 경우 수동 확인)" : " (니케/공급망형 사이드로딩 기법)")}",
                     ActionType = canQuarantine ? RemediationActionType.TerminateAndQuarantine : RemediationActionType.ManualReview,
@@ -199,6 +212,19 @@ public static class DllSideloadingDetector
         catch { }
 
         return results;
+    }
+
+    private static string ComputeFileSha256Safe(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return Convert.ToHexString(SHA256.HashData(fs));
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     private static DllSideloadFinding Clean() =>

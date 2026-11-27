@@ -35,6 +35,14 @@ public enum ThreatCategory
     SystemHardening
 }
 
+public enum TelemetryHealthState
+{
+    Stopped = 0,
+    EtwKernelActive = 1,
+    DegradedFallbackActive = 2,
+    StandardFallbackActive = 3
+}
+
 public enum SecurityActionTaken
 {
     Logged = 0,

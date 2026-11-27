@@ -8,6 +8,11 @@ using AegisSentinel.Core.Services;
 
 namespace AegisSentinel.Core.Engine;
 
+public interface IEtwKernelSessionRunner
+{
+    bool TryStart(out Action runListenerBlocking, out Action stopSession);
+}
+
 public sealed class EtwKernelTelemetryService : IDisposable
 {
     private const string SessionName = "AegisSentinelKernelTelemetry";
@@ -23,12 +28,16 @@ public sealed class EtwKernelTelemetryService : IDisposable
     private readonly BehaviorRiskEngine _riskEngine;
     private readonly Func<GuardPolicy> _policyProvider;
     private readonly TelemetryMetrics? _metrics;
+    private readonly IEtwKernelSessionRunner? _sessionRunner;
+    private readonly Func<bool> _isElevatedProvider;
 
     private static readonly string CachedWindowsDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows).TrimEnd('\\') + "\\";
     private readonly ConcurrentDictionary<int, (string Name, string Path)> _pidCache = new();
     private readonly ConcurrentDictionary<ulong, string> _fileObjectToPath = new();
     private readonly ConcurrentDictionary<ulong, string> _fileKeyToPath = new();
     private TraceEventSession? _session;
+    private Action? _customStopSession;
+    private object? _activeSessionToken;
     private Thread? _listenerThread;
     private Timer? _flushTimer;
     private int _flushTick;
@@ -37,6 +46,7 @@ public sealed class EtwKernelTelemetryService : IDisposable
     public bool IsRunning => _running;
     public event Action<SecurityEvent>? ThreatDetected;
     public event Action<string>? TelemetryError;
+    public event Action<string>? SessionStoppedUnexpectedly;
 
     public EtwKernelTelemetryService(
         ProcessController processController,
@@ -49,7 +59,9 @@ public sealed class EtwKernelTelemetryService : IDisposable
         NetworkGuardMonitor networkGuard,
         BehaviorRiskEngine riskEngine,
         Func<GuardPolicy> policyProvider,
-        TelemetryMetrics? metrics = null)
+        TelemetryMetrics? metrics = null,
+        IEtwKernelSessionRunner? sessionRunner = null,
+        Func<bool>? isElevatedProvider = null)
     {
         _processController = processController;
         _signatureVerifier = signatureVerifier;
@@ -62,16 +74,49 @@ public sealed class EtwKernelTelemetryService : IDisposable
         _riskEngine = riskEngine;
         _policyProvider = policyProvider;
         _metrics = metrics;
+        _sessionRunner = sessionRunner;
+        _isElevatedProvider = isElevatedProvider ?? ProcessController.IsCurrentProcessElevated;
     }
 
     public bool Start()
     {
-        if (!ProcessController.IsCurrentProcessElevated())
+        if (!_isElevatedProvider())
         {
             return false;
         }
 
         Stop();
+
+        if (_sessionRunner is not null)
+        {
+            try
+            {
+                if (!_sessionRunner.TryStart(out var runListenerBlocking, out var stopSession))
+                {
+                    TelemetryError?.Invoke("ETW 시작 실패: 커널 세션 드라이버 초기화 거부됨");
+                    return false;
+                }
+
+                var sessionToken = new object();
+                _activeSessionToken = sessionToken;
+                _customStopSession = stopSession;
+                _running = true;
+
+                _listenerThread = new Thread(() => RunListenerLoop(sessionToken, runListenerBlocking))
+                {
+                    IsBackground = true,
+                    Name = "AegisSentinel-ETW-Kernel"
+                };
+                _listenerThread.Start();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                TelemetryError?.Invoke($"ETW 시작 실패: {ex.Message}");
+                Stop();
+                return false;
+            }
+        }
 
         try
         {
@@ -87,7 +132,9 @@ public sealed class EtwKernelTelemetryService : IDisposable
                 StopOnDispose = true,
                 BufferSizeMB = 8
             };
+            var sessionToken = new object();
             _session = session;
+            _activeSessionToken = sessionToken;
 
             session.Source.Kernel.ProcessStart += OnProcessStart;
             session.Source.Kernel.ProcessStop += OnProcessStop;
@@ -125,24 +172,7 @@ public sealed class EtwKernelTelemetryService : IDisposable
                 try { session.Flush(); } catch { }
             }, null, TimeSpan.FromMilliseconds(1200), TimeSpan.FromMilliseconds(1200));
 
-            _listenerThread = new Thread(() =>
-            {
-                try
-                {
-                    session.Source.Process();
-                }
-                catch (Exception ex) when (_running && ReferenceEquals(_session, session))
-                {
-                    TelemetryError?.Invoke($"ETW 세션 중단: {ex.Message}");
-                }
-                finally
-                {
-                    if (ReferenceEquals(_session, session))
-                    {
-                        _running = false;
-                    }
-                }
-            })
+            _listenerThread = new Thread(() => RunListenerLoop(sessionToken, () => session.Source.Process()))
             {
                 IsBackground = true,
                 Name = "AegisSentinel-ETW-Kernel"
@@ -158,11 +188,58 @@ public sealed class EtwKernelTelemetryService : IDisposable
         }
     }
 
+    private void RunListenerLoop(object sessionToken, Action runListenerBlocking)
+    {
+        bool unexpectedDrop = false;
+        string? dropReason = null;
+        try
+        {
+            runListenerBlocking();
+            if (_running && ReferenceEquals(_activeSessionToken, sessionToken))
+            {
+                unexpectedDrop = true;
+                dropReason = "ETW 커널 세션 리스너가 예기치 않게 종료되었습니다.";
+            }
+        }
+        catch (Exception ex) when (_running && ReferenceEquals(_activeSessionToken, sessionToken))
+        {
+            unexpectedDrop = true;
+            dropReason = $"ETW 세션 중단: {ex.Message}";
+        }
+        catch
+        {
+            // Intentional Stop() closed the session while Process() was blocked.
+        }
+        finally
+        {
+            if (ReferenceEquals(_activeSessionToken, sessionToken))
+            {
+                _running = false;
+                _flushTimer?.Dispose();
+                _flushTimer = null;
+            }
+        }
+
+        if (unexpectedDrop)
+        {
+            var reason = dropReason ?? "ETW 커널 세션이 예기치 않게 중단되었습니다.";
+            TelemetryError?.Invoke(reason);
+            SessionStoppedUnexpectedly?.Invoke(reason);
+        }
+    }
+
     public void Stop()
     {
         _running = false;
+        _activeSessionToken = null;
         _flushTimer?.Dispose();
         _flushTimer = null;
+
+        var customStop = Interlocked.Exchange(ref _customStopSession, null);
+        if (customStop is not null)
+        {
+            try { customStop(); } catch { }
+        }
 
         try
         {

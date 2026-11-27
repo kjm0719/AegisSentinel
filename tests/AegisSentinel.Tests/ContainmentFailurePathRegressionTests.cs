@@ -155,14 +155,14 @@ public sealed class ContainmentFailurePathRegressionTests : IDisposable
         var payload = Encoding.UTF8.GetBytes("VALUABLE-FILE-PROTECTED-FROM-REBOOT-DELETE");
         File.WriteAllBytes(target, payload);
 
-        // Quarantine with immediate delete failing and reboot delete scheduled
-        var qmSchedule = new QuarantineManager(
-            dir,
-            deleteFileOverride: _ => false,
-            scheduleRebootDeleteOverride: _ => true);
-
-        var entry = qmSchedule.QuarantineFile(target, "P1-A reboot delete scheduled");
-        Assert.Equal(QuarantineDisposition.ScheduledDeleteOnReboot, entry.Disposition);
+        // Model metadata persisted by a previous release with a pending reboot deletion.
+        var qm = new QuarantineManager(dir, deleteFileOverride: _ => false);
+        var entry = qm.QuarantineFile(target, "legacy pending reboot") with
+        {
+            Disposition = QuarantineDisposition.ScheduledDeleteOnReboot
+        };
+        File.WriteAllText(Path.Combine(qm.QuarantineDirectory, $"{entry.Id}.json"),
+            System.Text.Json.JsonSerializer.Serialize(entry));
 
         // Remove original so restore writes cleanly to destination without conflict
         File.Delete(target);

@@ -36,7 +36,6 @@ public sealed class QuarantineManager
     private readonly string _keyFilePath;
     private readonly object _keySync = new();
     private readonly Func<string, bool>? _deleteFileOverride;
-    private readonly Func<string, bool>? _scheduleRebootDeleteOverride;
     private readonly Func<string, bool>? _cancelRebootDeleteOverride;
     private readonly Func<string, bool>? _isRebootDeleteScheduledOverride;
     private readonly Action<string, string>? _writeMetadataOverride;
@@ -69,7 +68,7 @@ public sealed class QuarantineManager
         Directory.CreateDirectory(QuarantineDirectory);
         _keyFilePath = Path.Combine(QuarantineDirectory, ".quarantine_aes.key");
         _deleteFileOverride = deleteFileOverride;
-        _scheduleRebootDeleteOverride = scheduleRebootDeleteOverride;
+        // Retained in the public constructor for compatibility with existing callers.
         _cancelRebootDeleteOverride = cancelRebootDeleteOverride;
         _isRebootDeleteScheduledOverride = isRebootDeleteScheduledOverride;
         _writeMetadataOverride = writeMetadataOverride;
@@ -110,7 +109,7 @@ public sealed class QuarantineManager
         }
     }
 
-    public QuarantineEntry QuarantineFile(string originalPath, string reason)
+    public QuarantineEntry QuarantineFile(string originalPath, string reason, string? expectedSha256 = null)
     {
         if (!File.Exists(originalPath))
         {
@@ -228,6 +227,22 @@ public sealed class QuarantineManager
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(expectedSha256) &&
+                !sha256.Equals(expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                try { if (File.Exists(qFilePath)) File.Delete(qFilePath); } catch { }
+                return new QuarantineEntry(
+                    id,
+                    originalPath,
+                    string.Empty,
+                    DateTimeOffset.Now,
+                    $"{reason} [검사 시점과 파일 해시(SHA-256)가 달라 원본을 보존하고 격리를 중단함]",
+                    sha256,
+                    fileSize,
+                    QuarantineDisposition.OriginalChangedNotRemoved,
+                    encryptionFormat);
+            }
+
             _onAfterArtifactWrittenBeforeVerifyForTest?.Invoke(qFilePath);
 
             // P2 Pre-delete full cryptographic streaming verification:
@@ -294,20 +309,9 @@ public sealed class QuarantineManager
         }
         else
         {
-            // File is genuinely locked AND verified unchanged -> schedule automatic OS kernel deletion on next reboot
-            bool scheduled = _scheduleRebootDeleteOverride is not null
-                ? _scheduleRebootDeleteOverride(originalPath)
-                : Native.NativeMethods.MoveFileEx(originalPath, null, Native.NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
-            if (scheduled)
-            {
-                disposition = QuarantineDisposition.ScheduledDeleteOnReboot;
-                finalReason = $"{reason} [사용 중 잠김 — 재부팅 시 OS 자동 삭제 예약됨]";
-            }
-            else
-            {
-                disposition = QuarantineDisposition.CopyOnlyOriginalLocked;
-                finalReason = $"{reason} [원본 잠금 상태로 격리 사본만 보관됨 — 원본 미제거]";
-            }
+            // A reboot operation identifies only a path; a replacement file could occupy it by then.
+            disposition = QuarantineDisposition.CopyOnlyOriginalLocked;
+            finalReason = $"{reason} [원본 제거 보류 — 격리 사본만 보관됨]";
         }
 
         var entry = pendingEntry with
@@ -479,7 +483,7 @@ public sealed class QuarantineManager
     private enum OriginalRemovalOutcome
     {
         Removed,
-        LockedNeedRebootSchedule,
+        OriginalRetained,
         ChangedOrReplacedPreserved
     }
 
@@ -579,7 +583,7 @@ public sealed class QuarantineManager
             if (preCheck == SnapshotMatchStatus.ChangedOrReplaced) return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
             return _deleteFileOverride(originalPath)
                 ? OriginalRemovalOutcome.Removed
-                : OriginalRemovalOutcome.LockedNeedRebootSchedule;
+                : OriginalRemovalOutcome.OriginalRetained;
         }
 
         const int maxAttempts = 5;
@@ -679,11 +683,11 @@ public sealed class QuarantineManager
             }
         }
 
-        // Final check before reporting locked for reboot-delete scheduling: never schedule on a replaced file!
+        // Classify the remaining file without scheduling any later deletion.
         var finalCheck = VerifyCurrentPathMatchesSnapshot(originalPath, expectedIdentity, expectedSha256, expectedSize);
         if (finalCheck == SnapshotMatchStatus.NotFound) return OriginalRemovalOutcome.Removed;
         if (finalCheck == SnapshotMatchStatus.ChangedOrReplaced) return OriginalRemovalOutcome.ChangedOrReplacedPreserved;
-        return OriginalRemovalOutcome.LockedNeedRebootSchedule;
+        return OriginalRemovalOutcome.OriginalRetained;
     }
 
     /// <summary>

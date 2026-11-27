@@ -41,11 +41,16 @@ public sealed class SecurityOrchestrator : IDisposable
     private readonly ConcurrentDictionary<int, (string ProcessPath, DateTimeOffset AllowedAt)> _sessionAllowedPids = new();
     private readonly ConcurrentDictionary<int, byte> _activeInterventionPids = new();
     private readonly object _lifecycleLock = new();
+    private readonly Func<bool> _isElevatedProvider;
+    private readonly TimeSpan _etwRecoveryInterval;
     private volatile GuardPolicy _policy;
     private volatile bool _isRunning;
+    private TelemetryHealthState _telemetryState = TelemetryHealthState.Stopped;
+    private string _telemetryStatusSummary = "중지됨";
     private Timer? _vaultSyncTimer;
     private Timer? _memorySweepTimer;
     private Timer? _dailyDbSyncTimer;
+    private Timer? _etwRecoveryTimer;
     private int _vaultTick;
     private int _memorySweepTick;
     private int _isSyncingVault;
@@ -54,6 +59,10 @@ public sealed class SecurityOrchestrator : IDisposable
     public bool IsRunning => _isRunning;
     public bool IsEtwKernelModeActive => _etwService.IsRunning;
     public bool IsEtwDnsModeActive => _etwDnsService.IsRunning;
+    public TelemetryHealthState TelemetryState => _telemetryState;
+    public bool IsDegradedFallbackActive => _telemetryState == TelemetryHealthState.DegradedFallbackActive;
+    public bool IsFallbackProcessPollingActive => _fallbackMonitor.IsProcessPollingActive;
+    public string TelemetryStatusSummary => _telemetryStatusSummary;
     public GuardPolicy CurrentPolicy => _policy;
     public QuarantineManager Quarantine => _quarantineManager;
     public RecoveryVault Vault => _recoveryVault;
@@ -76,14 +85,22 @@ public sealed class SecurityOrchestrator : IDisposable
     public event Action<SecurityEvent>? UserInterventionRequired;
     public event Action<string>? EngineStatusMessage;
     public event Action<string>? DatabaseUpdated;
+    public event Action<TelemetryHealthState, string>? TelemetryStateChanged;
+    public event Action<int, string, string>? FallbackProcessObserved;
 
     public SecurityOrchestrator(
         PolicyStore? policyStore = null,
         ProcessController? processController = null,
-        QuarantineManager? quarantineManager = null)
+        QuarantineManager? quarantineManager = null,
+        IEtwKernelSessionRunner? etwSessionRunner = null,
+        Func<bool>? isElevatedProvider = null,
+        Func<IReadOnlyList<(int Pid, string Name)>>? fallbackProcessSnapshotProvider = null,
+        TimeSpan? etwRecoveryInterval = null)
     {
         _policyStore = policyStore ?? new PolicyStore();
         _policy = _policyStore.Load();
+        _isElevatedProvider = isElevatedProvider ?? ProcessController.IsCurrentProcessElevated;
+        _etwRecoveryInterval = etwRecoveryInterval ?? TimeSpan.FromSeconds(30);
 
         _processController = processController ?? new ProcessController();
         _signatureVerifier = new SignatureVerifier();
@@ -120,7 +137,9 @@ public sealed class SecurityOrchestrator : IDisposable
             _networkGuard,
             _riskEngine,
             () => _policy,
-            _metrics);
+            _metrics,
+            sessionRunner: etwSessionRunner,
+            isElevatedProvider: _isElevatedProvider);
         _etwDnsService = new EtwDnsTelemetryService(_processController, _networkGuard, () => _policy, _metrics);
         _fallbackMonitor = new FallbackProcessAndFileMonitor(
             _processController,
@@ -128,12 +147,16 @@ public sealed class SecurityOrchestrator : IDisposable
             _processEvaluator,
             _ransomwareDetector,
             _canaryManager,
-            () => _policy);
+            () => _policy,
+            processSnapshotProvider: fallbackProcessSnapshotProvider,
+            pollInterval: fallbackProcessSnapshotProvider is not null ? TimeSpan.FromMilliseconds(40) : null);
 
         _etwService.ThreatDetected += HandleDetectedThreat;
         _etwService.TelemetryError += msg => EngineStatusMessage?.Invoke(msg);
+        _etwService.SessionStoppedUnexpectedly += HandleEtwSessionDroppedUnexpectedly;
         _etwDnsService.ThreatDetected += HandleDetectedThreat;
         _fallbackMonitor.ThreatDetected += HandleDetectedThreat;
+        _fallbackMonitor.NewProcessObserved += (pid, name, path) => FallbackProcessObserved?.Invoke(pid, name, path);
         _persistenceMonitor.ThreatDetected += HandleDetectedThreat;
         _credentialGuard.ThreatDetected += HandleDetectedThreat;
         _networkGuard.ThreatDetected += HandleDetectedThreat;
@@ -172,7 +195,7 @@ public sealed class SecurityOrchestrator : IDisposable
 
             bool etwStarted = false;
             bool etwDnsStarted = false;
-            if (_policy.EnableEtwTelemetry && ProcessController.IsCurrentProcessElevated())
+            if (_policy.EnableEtwTelemetry && _isElevatedProvider())
             {
                 etwStarted = _etwService.Start();
                 etwDnsStarted = _etwDnsService.Start();
@@ -273,10 +296,83 @@ public sealed class SecurityOrchestrator : IDisposable
                 TimeSpan.FromHours(1));
 
             _isRunning = true;
-            EngineStatusMessage?.Invoke(etwStarted
+            _telemetryState = etwStarted
+                ? TelemetryHealthState.EtwKernelActive
+                : TelemetryHealthState.StandardFallbackActive;
+            _telemetryStatusSummary = etwStarted
                 ? "엔터프라이즈 9중 방어 + ETW 커널 텔레메트리 활성화됨 (관리자 모드)"
-                : "스마트 저마찰 9중 방어 활성화됨 (ETW 커널 텔레메트리는 관리자 승격 시 활성화)");
+                : "스마트 저마찰 9중 방어 활성화됨 (ETW 커널 텔레메트리는 관리자 승격 시 활성화)";
+
+            TelemetryStateChanged?.Invoke(_telemetryState, _telemetryStatusSummary);
+            EngineStatusMessage?.Invoke(_telemetryStatusSummary);
         }
+    }
+
+    private void HandleEtwSessionDroppedUnexpectedly(string reason)
+    {
+        string degradedMessage;
+        lock (_lifecycleLock)
+        {
+            if (!_isRunning) return;
+
+            _telemetryState = TelemetryHealthState.DegradedFallbackActive;
+            _fallbackMonitor.SetProcessPollingEnabled(true);
+            _networkGuard.SetEtwNetworkHandling(false);
+
+            degradedMessage = $"제한 모드 전환: ETW 커널 수집기 중단으로 보조 프로세스/네트워크 폴링으로 자동 전환되었습니다 ({reason})";
+            _telemetryStatusSummary = degradedMessage;
+
+            _etwRecoveryTimer?.Dispose();
+            _etwRecoveryTimer = new Timer(
+                _ => _ = TryRecoverEtwKernelTelemetry(),
+                null,
+                _etwRecoveryInterval,
+                _etwRecoveryInterval);
+        }
+
+        TelemetryStateChanged?.Invoke(TelemetryHealthState.DegradedFallbackActive, degradedMessage);
+        EngineStatusMessage?.Invoke(degradedMessage);
+    }
+
+    /// <summary>
+    /// Attempts to recover ETW kernel telemetry after a mid-run drop.
+    /// On success, disables redundant fallback polling and transitions back to EtwKernelActive.
+    /// </summary>
+    public bool TryRecoverEtwKernelTelemetry()
+    {
+        string? recoveredMessage = null;
+        lock (_lifecycleLock)
+        {
+            if (!_isRunning || !_policy.EnableEtwTelemetry || !_isElevatedProvider())
+            {
+                return false;
+            }
+
+            if (_etwService.IsRunning && _telemetryState == TelemetryHealthState.EtwKernelActive)
+            {
+                return true;
+            }
+
+            _etwService.Stop();
+            if (!_etwService.Start())
+            {
+                return false;
+            }
+
+            _etwRecoveryTimer?.Dispose();
+            _etwRecoveryTimer = null;
+
+            _fallbackMonitor.SetProcessPollingEnabled(false);
+            _networkGuard.SetEtwNetworkHandling(true);
+
+            _telemetryState = TelemetryHealthState.EtwKernelActive;
+            recoveredMessage = "ETW 커널 텔레메트리 복구 완료 — 정상 커널 감시 모드로 전환되었습니다.";
+            _telemetryStatusSummary = recoveredMessage;
+        }
+
+        TelemetryStateChanged?.Invoke(TelemetryHealthState.EtwKernelActive, recoveredMessage);
+        EngineStatusMessage?.Invoke(recoveredMessage);
+        return true;
     }
 
     private async Task CheckAndSyncDailyDatabaseAsync()
@@ -324,6 +420,10 @@ public sealed class SecurityOrchestrator : IDisposable
             _memorySweepTimer = null;
             _dailyDbSyncTimer?.Dispose();
             _dailyDbSyncTimer = null;
+            _etwRecoveryTimer?.Dispose();
+            _etwRecoveryTimer = null;
+            _telemetryState = TelemetryHealthState.Stopped;
+            _telemetryStatusSummary = "중지됨";
 
             _etwService.Stop();
             _etwDnsService.Stop();

@@ -168,8 +168,10 @@ public partial class MainWindow : Window
     private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
 
     private static readonly SolidColorBrush BrushBadgeActiveBg = CreateFrozenBrush(6, 78, 59);
+    private static readonly SolidColorBrush BrushBadgeDegradedBg = CreateFrozenBrush(120, 53, 15);
     private static readonly SolidColorBrush BrushBadgePausedBg = CreateFrozenBrush(127, 29, 29);
     private static readonly SolidColorBrush BrushBadgeActiveFg = CreateFrozenBrush(110, 231, 183);
+    private static readonly SolidColorBrush BrushBadgeDegradedFg = CreateFrozenBrush(253, 230, 138);
     private static readonly SolidColorBrush BrushBadgePausedFg = CreateFrozenBrush(252, 165, 165);
     private static readonly SolidColorBrush BrushCardActiveFg = CreateFrozenBrush(16, 185, 129);
     private static readonly SolidColorBrush BrushCardInactiveFg = CreateFrozenBrush(148, 163, 184);
@@ -191,6 +193,7 @@ public partial class MainWindow : Window
     private Action<SecurityEvent>? _onEventRecordedHandler;
     private Action<string>? _onEngineStatusHandler;
     private Action<string>? _onDatabaseUpdatedHandler;
+    private Action<TelemetryHealthState, string>? _onTelemetryStateChangedHandler;
 
     public bool AllowClose { get; set; }
 
@@ -254,6 +257,16 @@ public partial class MainWindow : Window
             });
         };
         _orchestrator.DatabaseUpdated += _onDatabaseUpdatedHandler;
+
+        _onTelemetryStateChangedHandler = (_, msg) =>
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                RefreshEngineStateUi();
+                FooterMessageText.Text = msg;
+            });
+        };
+        _orchestrator.TelemetryStateChanged += _onTelemetryStateChangedHandler;
 
         LoadPolicyIntoUi();
         RefreshEngineStateUi();
@@ -388,6 +401,7 @@ public partial class MainWindow : Window
         if (_onEventRecordedHandler is not null) _orchestrator.EventRecorded -= _onEventRecordedHandler;
         if (_onEngineStatusHandler is not null) _orchestrator.EngineStatusMessage -= _onEngineStatusHandler;
         if (_onDatabaseUpdatedHandler is not null) _orchestrator.DatabaseUpdated -= _onDatabaseUpdatedHandler;
+        if (_onTelemetryStateChangedHandler is not null) _orchestrator.TelemetryStateChanged -= _onTelemetryStateChangedHandler;
         try { Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         if (_registeredHwnd != IntPtr.Zero)
         {
@@ -459,16 +473,25 @@ public partial class MainWindow : Window
         bool elevated = ProcessController.IsCurrentProcessElevated();
         bool etw = _orchestrator.IsEtwKernelModeActive;
         bool etwDns = _orchestrator.IsEtwDnsModeActive;
+        bool degraded = _orchestrator.IsDegradedFallbackActive;
 
         AppEditionSubtitleText.Text = elevated ? "Enterprise Guard v7.0 (Admin)" : "Enterprise Guard v7.0 (User Mode)";
-        StatusBadgeText.Text = running ? "실시간 통합 방어 작동 중" : "보호 일시 중지됨";
-        StatusBadgeBorder.Background = running ? BrushBadgeActiveBg : BrushBadgePausedBg;
-        StatusBadgeText.Foreground = running ? BrushBadgeActiveFg : BrushBadgePausedFg;
+        StatusBadgeText.Text = !running
+            ? "보호 일시 중지됨"
+            : (degraded ? "제한 모드 (보조 폴링 감시)" : "실시간 통합 방어 작동 중");
+        StatusBadgeBorder.Background = !running
+            ? BrushBadgePausedBg
+            : (degraded ? BrushBadgeDegradedBg : BrushBadgeActiveBg);
+        StatusBadgeText.Foreground = !running
+            ? BrushBadgePausedFg
+            : (degraded ? BrushBadgeDegradedFg : BrushBadgeActiveFg);
 
         var powerNote = PowerProfileHelper.IsOnBatteryPower ? " · 배터리 절전" : string.Empty;
-        TelemetryBadgeText.Text = (etw
-            ? (etwDns ? "ETW 커널 + 실시간 DNS + 레지스트리 (Admin)" : "ETW 커널 텔레메트리 활성 (Admin)")
-            : (elevated ? "관리자 모드" : "유저 모드 (ETW는 승격 필요)")) + powerNote;
+        TelemetryBadgeText.Text = (degraded
+            ? "제한 모드 — ETW 커널 중단 (보조 폴링 자동 전환됨)"
+            : (etw
+                ? (etwDns ? "ETW 커널 + 실시간 DNS + 레지스트리 (Admin)" : "ETW 커널 텔레메트리 활성 (Admin)")
+                : (elevated ? "관리자 모드" : "유저 모드 (ETW는 승격 필요)"))) + powerNote;
 
         ElevateButton.Visibility = elevated ? Visibility.Collapsed : Visibility.Visible;
         ToggleEngineButton.Content = running ? "감시 일시중지" : "감시 재개";

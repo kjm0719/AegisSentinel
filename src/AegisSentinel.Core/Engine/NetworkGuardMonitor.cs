@@ -125,6 +125,19 @@ public sealed class NetworkGuardMonitor : IDisposable
         }
     }
 
+    public void SetEtwNetworkHandling(bool etwHandlesNetwork)
+    {
+        if (etwHandlesNetwork)
+        {
+            _pollTimer?.Dispose();
+            _pollTimer = null;
+        }
+        else if (_pollTimer is null)
+        {
+            _pollTimer = new Timer(_ => PollTcpTable(), null, TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(1500));
+        }
+    }
+
     public void RecordDnsResolution(string domain, string ip)
     {
         if (string.IsNullOrWhiteSpace(domain) || string.IsNullOrWhiteSpace(ip)) return;

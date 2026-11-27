@@ -212,9 +212,18 @@ public sealed class MzkDeepScanner
                 {
                     if (proc.Id <= 4 || proc.Id == Environment.ProcessId) continue;
                     try { if (proc.HasExited) continue; } catch { }
-                    var path = _processController.GetExecutablePath(proc.Id);
+                    _processController.TryGetProcessInstanceIdentity(proc.Id, out var procIdentity);
+                    var path = !string.IsNullOrWhiteSpace(procIdentity?.ExecutablePath)
+                        ? procIdentity.ExecutablePath
+                        : _processController.GetExecutablePath(proc.Id);
                     if (string.IsNullOrWhiteSpace(path)) continue;
                     if (ProcessRuleEvaluator.IsProtectedHostIdeProcess(path)) continue;
+
+                    long creationTimeUtc = procIdentity?.CreationTimeFileTimeUtc ?? 0;
+                    if (creationTimeUtc == 0)
+                    {
+                        try { creationTimeUtc = proc.StartTime.ToUniversalTime().ToFileTimeUtc(); } catch { }
+                    }
 
                     scanned++;
                     bool fileExists = File.Exists(path);
@@ -235,6 +244,9 @@ public sealed class MzkDeepScanner
                                 RiskScore = 95,
                                 TargetPath = path,
                                 ProcessId = proc.Id,
+                                ProcessCreationTimeFileTimeUtc = creationTimeUtc,
+                                HostProcessPath = path,
+                                TargetFileExistedAtScan = false,
                                 SignatureLabel = "디스크 원본 삭제됨",
                                 Description = $"실행 파일이 디스크에서 삭제된 채 메모리에서 실행 중입니다 (PID {proc.Id}, {path})",
                                 ActionType = RemediationActionType.TerminateAndQuarantine,
@@ -268,6 +280,10 @@ public sealed class MzkDeepScanner
                             RiskScore = eval.RiskScore,
                             TargetPath = path,
                             ProcessId = proc.Id,
+                            ProcessCreationTimeFileTimeUtc = creationTimeUtc,
+                            HostProcessPath = path,
+                            TargetFileExistedAtScan = true,
+                            Sha256 = ComputeFileSha256Safe(path),
                             SignatureLabel = sig.DisplayLabel,
                             Description = $"{eval.Title} — {eval.Description}",
                             ActionType = QuarantineManager.IsProtectedSystemOrSelfPath(path)
@@ -289,14 +305,25 @@ public sealed class MzkDeepScanner
                         var fileFinding = _threatScanner.ScanFile(path, policy, includeClean: false);
                         if (fileFinding is not null && fileFinding.RiskScore >= 55)
                         {
-                            findings.Add(ConvertScanFindingToThreatItem(fileFinding, MalwareScanStage.ActiveProcessAndMemory, proc.Id));
+                            findings.Add(ConvertScanFindingToThreatItem(
+                                fileFinding,
+                                MalwareScanStage.ActiveProcessAndMemory,
+                                proc.Id,
+                                creationTimeUtc,
+                                path));
                         }
                     }
 
                     // 1C. Live DLL Sideloading check on signed running processes (deduplicated per host binary!)
                     if (sig.IsSigned && !isTrustedWindowsInbox && seenSideloadHosts.Add(path))
                     {
-                        foreach (var sideloadHit in DllSideloadingDetector.InspectRunningProcessModules(proc, path, sig, _signatureVerifier, ct))
+                        foreach (var sideloadHit in DllSideloadingDetector.InspectRunningProcessModules(
+                            proc,
+                            path,
+                            sig,
+                            _signatureVerifier,
+                            ct,
+                            hostCreationTimeFileTimeUtc: creationTimeUtc))
                         {
                             findings.Add(sideloadHit);
                         }
@@ -317,6 +344,10 @@ public sealed class MzkDeepScanner
                                 RiskScore = 92,
                                 TargetPath = path,
                                 ProcessId = proc.Id,
+                                ProcessCreationTimeFileTimeUtc = creationTimeUtc,
+                                HostProcessPath = path,
+                                TargetFileExistedAtScan = !memRes.IsGhostDeletedOnDisk && File.Exists(path),
+                                Sha256 = memRes.IsGhostDeletedOnDisk ? string.Empty : ComputeFileSha256Safe(path),
                                 SignatureLabel = sig.DisplayLabel,
                                 Description = $"비정상 Unbacked 실행 메모리 감지 (RWX={memRes.UnbackedRwxRegionCount}개, RX={memRes.UnbackedRxRegionCount}개, PID {proc.Id})",
                                 ActionType = RemediationActionType.TerminateAndQuarantine,
@@ -395,6 +426,7 @@ public sealed class MzkDeepScanner
                                                 exe.StartsWith(windowsDir + "System32\\", StringComparison.OrdinalIgnoreCase));
                 if (!isTrustedBenignDebugger)
                 {
+                    var ifeoAssoc = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null;
                     findings.Add(new MalwareThreatItem
                     {
                         Stage = MalwareScanStage.PersistenceAndService,
@@ -404,7 +436,8 @@ public sealed class MzkDeepScanner
                         RiskScore = 95,
                         TargetPath = entry.SourceLocation,
                         EntryName = entry.Name,
-                        AssociatedFilePath = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null,
+                        AssociatedFilePath = ifeoAssoc,
+                        AssociatedFileSha256 = ifeoAssoc is not null ? ComputeFileSha256Safe(ifeoAssoc) : null,
                         SignatureLabel = entrySigLabel,
                         Description = $"정상 프로그램 실행을 가로채는 IFEO Debugger 등록 감지: {entry.Name} → {entry.Value}",
                         ActionType = RemediationActionType.RollbackRegistryOrStartup,
@@ -448,6 +481,7 @@ public sealed class MzkDeepScanner
             // 2C. WMI CommandLineEventConsumer (Fileless persistence)
             if (entry.Category.Equals("WMI-Subscription", StringComparison.OrdinalIgnoreCase))
             {
+                var wmiAssoc = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null;
                 findings.Add(new MalwareThreatItem
                 {
                     Stage = MalwareScanStage.PersistenceAndService,
@@ -457,7 +491,8 @@ public sealed class MzkDeepScanner
                     RiskScore = 90,
                     TargetPath = entry.SourceLocation,
                     EntryName = entry.Name,
-                    AssociatedFilePath = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null,
+                    AssociatedFilePath = wmiAssoc,
+                    AssociatedFileSha256 = wmiAssoc is not null ? ComputeFileSha256Safe(wmiAssoc) : null,
                     SignatureLabel = entrySigLabel,
                     Description = $"WMI 영구 이벤트 소비자 감지: {entry.Name} → {entry.Value}",
                     ActionType = RemediationActionType.ManualReview,
@@ -491,6 +526,7 @@ public sealed class MzkDeepScanner
             if (hasSuspiciousCmd || isMaliciousFile || (isUnsignedRiskyDrop && isRunStartupOrTask))
             {
                 bool isTask = entry.Category.Equals("Scheduled-Task", StringComparison.OrdinalIgnoreCase);
+                var runAssoc = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null;
                 findings.Add(new MalwareThreatItem
                 {
                     Stage = MalwareScanStage.PersistenceAndService,
@@ -500,7 +536,8 @@ public sealed class MzkDeepScanner
                     RiskScore = (hasSuspiciousCmd || isMaliciousFile) ? 90 : 75,
                     TargetPath = entry.SourceLocation,
                     EntryName = entry.Name,
-                    AssociatedFilePath = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null,
+                    AssociatedFilePath = runAssoc,
+                    AssociatedFileSha256 = runAssoc is not null ? ComputeFileSha256Safe(runAssoc) : null,
                     SignatureLabel = entrySigLabel,
                     Description = $"[{entry.Category}] {entry.Name} → {entry.Value}",
                     ActionType = isTask ? RemediationActionType.DeleteScheduledTask : RemediationActionType.RollbackRegistryOrStartup,
@@ -574,6 +611,7 @@ public sealed class MzkDeepScanner
                     bool fileExists = !string.IsNullOrWhiteSpace(targetBin) && File.Exists(targetBin);
                     bool isDemandOrManual = svcKey.GetValue("Start") is int startVal && startVal == 3;
                     bool isConfirmedThreat = badCmd || staticMalicious;
+                    var svcAssoc = fileExists && !QuarantineManager.IsProtectedSystemOrSelfPath(targetBin) ? targetBin : null;
                     findings.Add(new MalwareThreatItem
                     {
                         Stage = MalwareScanStage.PersistenceAndService,
@@ -583,7 +621,8 @@ public sealed class MzkDeepScanner
                         RiskScore = isConfirmedThreat ? 95 : (fileExists && !isDemandOrManual ? 85 : 55),
                         TargetPath = $@"HKLM\SYSTEM\CurrentControlSet\Services\{svcName}",
                         EntryName = svcName,
-                        AssociatedFilePath = fileExists && !QuarantineManager.IsProtectedSystemOrSelfPath(targetBin) ? targetBin : null,
+                        AssociatedFilePath = svcAssoc,
+                        AssociatedFileSha256 = svcAssoc is not null ? ComputeFileSha256Safe(svcAssoc) : null,
                         SignatureLabel = sig.DisplayLabel,
                         Description = $"고위험 경로/명령줄을 사용하는 서비스 감지: {svcName} ({(!string.IsNullOrWhiteSpace(expandedDll) ? expandedDll : expanded)}){(!fileExists ? " [현재 디스크에 파일 없음 — 수동 확인 권장]" : string.Empty)}",
                         ActionType = RemediationActionType.DisableMaliciousService,
@@ -807,6 +846,8 @@ public sealed class MzkDeepScanner
                 Severity = hasDangerousFlag ? ThreatSeverity.Critical : ThreatSeverity.High,
                 RiskScore = hasDangerousFlag ? 90 : 80,
                 TargetPath = lnkPath,
+                TargetFileExistedAtScan = true,
+                Sha256 = ComputeFileSha256Safe(lnkPath),
                 SignatureLabel = "바로가기(.lnk) 분석",
                 Description = detail,
                 ActionType = RemediationActionType.CleanBrowserShortcut,
@@ -1371,6 +1412,7 @@ public sealed class MzkDeepScanner
                                 Severity = ThreatSeverity.Critical,
                                 RiskScore = 100,
                                 TargetPath = actualFile,
+                                Sha256 = canQuarantine ? ComputeFileSha256Safe(actualFile) : string.Empty,
                                 SignatureLabel = "Microsoft Defender 엔진 교차검증",
                                 Description = $"Windows Defender 글로벌 바이러스 DB에서 위협이 탐지되었습니다: {threatName} ({rawFile})",
                                 ActionType = canQuarantine ? RemediationActionType.QuarantineFile : RemediationActionType.ManualReview,
@@ -1434,7 +1476,12 @@ public sealed class MzkDeepScanner
         return results;
     }
 
-    private static MalwareThreatItem ConvertScanFindingToThreatItem(ScanFinding finding, MalwareScanStage stage, int? pid)
+    private static MalwareThreatItem ConvertScanFindingToThreatItem(
+        ScanFinding finding,
+        MalwareScanStage stage,
+        int? pid,
+        long processCreationTimeFileTimeUtc = 0,
+        string? hostProcessPath = null)
     {
         var reasonsText = finding.Reasons.Count > 0 ? string.Join(" | ", finding.Reasons) : "이상 없음 (정상 파일)";
         var threatName = DeriveThreatName(finding);
@@ -1449,6 +1496,9 @@ public sealed class MzkDeepScanner
             RiskScore = finding.RiskScore,
             TargetPath = finding.FilePath,
             ProcessId = pid,
+            ProcessCreationTimeFileTimeUtc = processCreationTimeFileTimeUtc,
+            HostProcessPath = hostProcessPath ?? (pid.HasValue ? finding.FilePath : null),
+            TargetFileExistedAtScan = File.Exists(finding.FilePath),
             Sha256 = finding.Sha256,
             SignatureLabel = finding.Signature.DisplayLabel,
             Description = reasonsText,
@@ -1597,13 +1647,33 @@ public sealed class MzkDeepScanner
             if (item.RiskScore > existing.RiskScore ||
                 (item.RiskScore == existing.RiskScore && item.ActionType == RemediationActionType.TerminateAndQuarantine && existing.ActionType == RemediationActionType.QuarantineFile))
             {
+                var mergedSha = !string.IsNullOrWhiteSpace(item.Sha256) ? item.Sha256 : existing.Sha256;
                 map[key] = existing.ProcessId.HasValue && !item.ProcessId.HasValue
-                    ? item with { ProcessId = existing.ProcessId, ActionType = RemediationActionType.TerminateAndQuarantine }
-                    : item;
+                    ? item with
+                    {
+                        ProcessId = existing.ProcessId,
+                        ProcessCreationTimeFileTimeUtc = existing.ProcessCreationTimeFileTimeUtc,
+                        HostProcessPath = existing.HostProcessPath,
+                        Sha256 = mergedSha,
+                        ActionType = RemediationActionType.TerminateAndQuarantine
+                    }
+                    : (mergedSha != item.Sha256 ? item with { Sha256 = mergedSha } : item);
             }
             else if (item.ProcessId.HasValue && !existing.ProcessId.HasValue)
             {
-                map[key] = existing with { ProcessId = item.ProcessId, ActionType = RemediationActionType.TerminateAndQuarantine };
+                var mergedSha = !string.IsNullOrWhiteSpace(existing.Sha256) ? existing.Sha256 : item.Sha256;
+                map[key] = existing with
+                {
+                    ProcessId = item.ProcessId,
+                    ProcessCreationTimeFileTimeUtc = item.ProcessCreationTimeFileTimeUtc,
+                    HostProcessPath = item.HostProcessPath,
+                    Sha256 = mergedSha,
+                    ActionType = RemediationActionType.TerminateAndQuarantine
+                };
+            }
+            else if (string.IsNullOrWhiteSpace(existing.Sha256) && !string.IsNullOrWhiteSpace(item.Sha256))
+            {
+                map[key] = existing with { Sha256 = item.Sha256 };
             }
         }
 
@@ -1611,5 +1681,18 @@ public sealed class MzkDeepScanner
             .OrderByDescending(x => x.RiskScore)
             .ThenBy(x => x.Stage)
             .ToList();
+    }
+
+    private static string ComputeFileSha256Safe(string filePath)
+    {
+        try
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fs));
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 }

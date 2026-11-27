@@ -36,6 +36,52 @@ public sealed class QuarantineChunkedAeadRegressionTests : IDisposable
         catch { }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StartupRemediationHonorsQuarantineOutcome(bool replaceDuringQuarantine)
+    {
+        var folder = Directory.CreateDirectory(Path.Combine(_tempRoot, "startup")).FullName;
+        var path = Path.Combine(folder, "sample.bin");
+        File.WriteAllText(path, "old");
+        var manager = new QuarantineManager(_tempRoot, onAfterArtifactWrittenBeforeVerifyForTest: _ =>
+        {
+            if (replaceDuringQuarantine)
+                File.WriteAllText(path, "new");
+        });
+        var service = new MalwareRemediationService(new ProcessController(), manager,
+            new AuditLogService(_tempRoot), _tempRoot);
+        var item = new MalwareThreatItem
+        {
+            TargetPath = folder, EntryName = Path.GetFileName(path), AssociatedFilePath = path,
+            ActionType = RemediationActionType.RollbackRegistryOrStartup
+        };
+
+        var result = service.CureSingleItem(item);
+
+        Assert.Equal(replaceDuringQuarantine, File.Exists(path));
+        if (replaceDuringQuarantine) Assert.Equal("new", File.ReadAllText(path));
+        Assert.Equal(!replaceDuringQuarantine, result.Success);
+        Assert.True(File.Exists(result.BackupPath));
+    }
+
+    [Fact]
+    public void ReadLockedOriginalRemainsCopyOnlyWithoutRebootDeletion()
+    {
+        var path = Path.Combine(_tempRoot, "read-locked.bin");
+        File.WriteAllText(path, "original");
+        int scheduled = 0;
+        var manager = new QuarantineManager(_tempRoot, scheduleRebootDeleteOverride: _ => { scheduled++; return true; });
+        using (File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            var entry = manager.QuarantineFile(path, "locked file");
+            Assert.Equal(QuarantineDisposition.CopyOnlyOriginalLocked, entry.Disposition);
+            Assert.True(File.Exists(entry.QuarantineFilePath));
+            Assert.Equal("original", File.ReadAllText(path));
+        }
+        Assert.Equal(0, scheduled);
+    }
+
     [Fact]
     public void P1_LargeFileQuarantine_MustUseChunkedAesGcmNotFixedXor_AndAuditActualFormat()
     {
