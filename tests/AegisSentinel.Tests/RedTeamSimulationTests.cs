@@ -1321,20 +1321,24 @@ public sealed class RedTeamSimulationTests : IDisposable
         var cleanScriptPath = Path.Combine(sampleDir, "clean_hello.ps1");
         File.WriteAllText(cleanScriptPath, "Write-Host 'Hello clean developer script'\n");
 
-        // 3. Browser shortcut (.lnk) hijacking detection (caught vs clean)
+        // 3. Browser shortcut (.lnk) hijacking detection (structured MS-SHLLINK parsing: dangerous flag caught vs clean/external-URL-only preserved)
         var hijackedLnk = Path.Combine(sampleDir, "Chrome_Hijacked.lnk");
-        var lnkHeader = new byte[76];
-        lnkHeader[0] = 0x4C;
-        var hijackedLnkBytes = lnkHeader.Concat(Encoding.ASCII.GetBytes(@"C:\Program Files\Google\Chrome\Application\chrome.exe http://ad-hijack.invalid/promo")).ToArray();
+        var hijackedLnkBytes = ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            arguments: "--profile-directory=\"Profile 1\" --load-extension=\"C:\\Temp\\evil_ext\"");
         File.WriteAllBytes(hijackedLnk, hijackedLnkBytes);
 
         var cleanLnk = Path.Combine(sampleDir, "Chrome_Clean.lnk");
-        var cleanLnkBytes = lnkHeader.Concat(Encoding.ASCII.GetBytes(@"C:\Program Files\Google\Chrome\Application\chrome.exe")).ToArray();
+        var cleanLnkBytes = ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            arguments: "--profile-directory=\"Profile 1\"");
         File.WriteAllBytes(cleanLnk, cleanLnkBytes);
 
         var hijackHit = MzkDeepScanner.InspectBrowserShortcutHijack(hijackedLnk);
         Assert.NotNull(hijackHit);
         Assert.Equal("Hijacker.Browser.ShortcutInjection", hijackHit!.ThreatName);
+        Assert.Equal(RemediationActionType.CleanBrowserShortcut, hijackHit.ActionType);
+        Assert.True(hijackHit.RecommendedForCure);
         Assert.Null(MzkDeepScanner.InspectBrowserShortcutHijack(cleanLnk));
 
         // 4. HOSTS DNS hijacking detection & surgical repair (preserving localhost & docker entries)
@@ -1819,17 +1823,17 @@ public sealed class RedTeamSimulationTests : IDisposable
         Assert.Single(ipv6Findings);
         Assert.Contains("ahnlab.com", ipv6Findings[0].EntryName);
 
-        // 10. .lnk hijack inspector handles odd-byte UTF-16LE offset & skips benign URL to catch 2nd evil URL
+        // 10. .lnk hijack inspector parses structured MS-SHLLINK TargetPath & Arguments, skips official URL, and surfaces external-URL-only as ManualReview (never auto-cure!)
         var oddLnkPath = Path.Combine(regDir, "Edge_OddOffset.lnk");
-        var header = new byte[77]; // Intentionally odd offset!
-        header[0] = 0x4C;
-        var lnkContent = header
-            .Concat(Encoding.Unicode.GetBytes(@"C:\Program Files\Microsoft\Edge\Application\msedge.exe https://www.microsoft.com http://evil-promo.invalid/ad"))
-            .ToArray();
+        var lnkContent = ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            arguments: "https://www.microsoft.com http://evil-promo.invalid/ad");
         File.WriteAllBytes(oddLnkPath, lnkContent);
         var oddLnkHit = MzkDeepScanner.InspectBrowserShortcutHijack(oddLnkPath);
         Assert.NotNull(oddLnkHit);
         Assert.Contains("evil-promo.invalid", oddLnkHit!.Description);
+        Assert.False(oddLnkHit.RecommendedForCure);
+        Assert.Equal(RemediationActionType.ManualReview, oddLnkHit.ActionType);
 
         // 11. Unlimited full-depth streaming BFS catches malware buried 12 levels deep!
         var deepRoot = Path.Combine(regDir, "deep_bfs_test");

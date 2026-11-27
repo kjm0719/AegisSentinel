@@ -919,10 +919,27 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
         Assert.Equal("legitimate-updated-svc-v2", File.ReadAllText(svcBin));
         Assert.Empty(quarantine.ListEntries());
 
-        // 2. Scheduled task associated file was updated -> task delete reported, file preserved & held!
+        // 2. Scheduled task definition matches scan, while associated file was updated -> task delete reported, file preserved & held!
         var taskBin = Path.Combine(_tempRoot, "updated_task_bin.exe");
         var oldTaskSha = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("old-task-v1")));
         File.WriteAllText(taskBin, "legitimate-updated-task-v2");
+
+        var taskXml = $"""
+            <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+              <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+              <Actions Context="Author"><Exec><Command>{taskBin}</Command><Arguments>--run-hidden</Arguments></Exec></Actions>
+            </Task>
+            """;
+        var taskDefHash = PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(@"\SuspiciousUpdaterTask", taskXml);
+
+        var remediationWithTaskReader = new MalwareRemediationService(
+            procCtrl,
+            quarantine,
+            auditLog,
+            _tempRoot,
+            commandRunnerOverride: (_, _) => (true, string.Empty),
+            scheduledTaskDefinitionReaderOverride: _ => (true, taskXml, string.Empty));
 
         var taskItem = new MalwareThreatItem
         {
@@ -934,11 +951,13 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
             EntryName = @"\SuspiciousUpdaterTask",
             AssociatedFilePath = taskBin,
             AssociatedFileSha256 = oldTaskSha,
+            ScheduledTaskDefinitionSha256 = taskDefHash,
             ActionType = RemediationActionType.DeleteScheduledTask
         };
 
-        var taskRes = remediation.CureSingleItem(taskItem);
+        var taskRes = remediationWithTaskReader.CureSingleItem(taskItem);
         Assert.False(taskRes.Success);
+        Assert.Equal(true, taskRes.ScheduledTaskDeleted);
         Assert.Equal(QuarantineDisposition.OriginalChangedNotRemoved, taskRes.FileQuarantineDisposition);
         Assert.Equal(SecurityActionTaken.RolledBack, taskRes.ActionTaken);
         Assert.Contains("예약 작업 제거 완료", taskRes.Message, StringComparison.Ordinal);
@@ -1032,7 +1051,7 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
         var quarantine = new QuarantineManager(_tempRoot);
         var auditLog = new AuditLogService(_tempRoot);
 
-        // 1. Happy path: preserve --profile-directory="Profile 2" and --lang=ko, strip ONLY malicious flags & untrusted URL!
+        // 1. Happy path: preserve --profile-directory="Profile 2", --lang=ko AND user startup URL, strip ONLY malicious flags!
         var chromeExe = Path.Combine(_tempRoot, "chrome.exe");
         File.WriteAllText(chromeExe, "fake-chrome");
         var shortcutPath = Path.Combine(_tempRoot, "Google Chrome.lnk");
@@ -1047,7 +1066,7 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
             shortcutReaderOverride: _ => (
                 true,
                 chromeExe,
-                "--profile-directory=\"Profile 2\" --lang=ko https://hijack-ads.invalid/start --load-extension=\"C:\\Temp\\evil_ext\" --remote-debugging-port=9222 --proxy-server=http://1.2.3.4:8080",
+                "--profile-directory=\"Profile 2\" --lang=ko https://portal.school.edu/home --load-extension=\"C:\\Temp\\evil_ext\" --remote-debugging-port=9222 --proxy-server=http://1.2.3.4:8080",
                 string.Empty),
             shortcutWriterOverride: (_, newArgs) =>
             {
@@ -1071,7 +1090,7 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
         Assert.NotNull(savedArgs);
         Assert.Contains("--profile-directory=\"Profile 2\"", savedArgs!, StringComparison.Ordinal);
         Assert.Contains("--lang=ko", savedArgs!, StringComparison.Ordinal);
-        Assert.DoesNotContain("hijack-ads.invalid", savedArgs!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("https://portal.school.edu/home", savedArgs!, StringComparison.Ordinal);
         Assert.DoesNotContain("--load-extension", savedArgs!, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("--remote-debugging-port", savedArgs!, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("--proxy-server", savedArgs!, StringComparison.OrdinalIgnoreCase);
@@ -1084,7 +1103,7 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
             quarantine,
             auditLog,
             _tempRoot,
-            shortcutReaderOverride: _ => (true, chromeExe, "--profile-directory=\"Profile 1\" https://hijack-ads.invalid", string.Empty),
+            shortcutReaderOverride: _ => (true, chromeExe, "--profile-directory=\"Profile 1\" --load-extension=\"C:\\Temp\\evil\"", string.Empty),
             shortcutWriterOverride: (_, _) => (false, "Access denied saving shortcut"));
 
         var saveFailRes = remediationSaveFail.CureSingleItem(shortcutItem);
@@ -1100,7 +1119,7 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
             auditLog,
             _tempRoot,
             shortcutBackupOverride: (_, _) => throw new IOException("Simulated disk full during shortcut backup"),
-            shortcutReaderOverride: _ => (true, chromeExe, "--profile-directory=\"Profile 1\" https://hijack-ads.invalid", string.Empty),
+            shortcutReaderOverride: _ => (true, chromeExe, "--profile-directory=\"Profile 1\" --load-extension=\"C:\\Temp\\evil\"", string.Empty),
             shortcutWriterOverride: (_, _) => (true, string.Empty));
 
         var backupFailRes = remediationBackupFail.CureSingleItem(shortcutItem);
@@ -1108,5 +1127,413 @@ public sealed class ManualRemediationAndFailoverRegressionTests : IDisposable
         Assert.Equal(SecurityActionTaken.Logged, backupFailRes.ActionTaken);
         Assert.True(File.Exists(shortcutPath));
         Assert.Empty(quarantine.ListEntries());
+    }
+
+    [Fact]
+    public void P1_R6_ScheduledTaskRemediation_ArgumentsChangedSinceScan_MustHoldDeleteAndQuarantine_AndAllowExactMatch()
+    {
+        var taskBin = Path.Combine(_tempRoot, "updater_task.exe");
+        File.WriteAllText(taskBin, "task-binary-v1");
+        var taskBinSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(taskBin)));
+
+        string BuildTaskXml(string args, string userId = "S-1-5-18", string trigger = "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>") =>
+            $"""
+            <?xml version="1.0" encoding="UTF-16"?>
+            <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <Triggers>{trigger}</Triggers>
+              <Principals><Principal id="Author"><UserId>{userId}</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+              <Actions Context="Author"><Exec><Command>{taskBin}</Command><Arguments>{args}</Arguments></Exec></Actions>
+            </Task>
+            """;
+
+        var scannedXml = BuildTaskXml("-w hidden -enc BADPAYLOAD");
+        var reformattedSameXml = $"<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\" version=\"1.2\"><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{taskBin}</Command><Arguments>-w hidden -enc BADPAYLOAD</Arguments></Exec></Actions></Task>";
+        var changedArgsXml = BuildTaskXml("--normal-update-check");
+        var changedPrincipalXml = BuildTaskXml("-w hidden -enc BADPAYLOAD", userId: "S-1-5-21-9999");
+        var changedTriggerXml = BuildTaskXml("-w hidden -enc BADPAYLOAD", trigger: "<BootTrigger><Enabled>true</Enabled></BootTrigger>");
+
+        const string taskPath = @"\VendorSuite\AutoUpdater";
+        var scannedHash = PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(taskPath, scannedXml);
+        Assert.NotEmpty(scannedHash);
+        // Formatting / attribute order changes must yield the exact same canonical hash
+        Assert.Equal(scannedHash, PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(taskPath, reformattedSameXml));
+        // Any change in arguments, principal, or trigger MUST yield a different hash
+        Assert.NotEqual(scannedHash, PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(taskPath, changedArgsXml));
+        Assert.NotEqual(scannedHash, PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(taskPath, changedPrincipalXml));
+        Assert.NotEqual(scannedHash, PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(taskPath, changedTriggerXml));
+
+        var procCtrl = new ProcessController();
+        var quarantine = new QuarantineManager(_tempRoot);
+        var auditLog = new AuditLogService(_tempRoot);
+
+        int deleteCalls = 0;
+        string currentLiveXml = changedArgsXml;
+        bool failLiveRead = false;
+
+        var remediation = new MalwareRemediationService(
+            procCtrl,
+            quarantine,
+            auditLog,
+            _tempRoot,
+            commandRunnerOverride: (exe, args) =>
+            {
+                if (exe.Equals("schtasks.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    deleteCalls++;
+                }
+                return (true, string.Empty);
+            },
+            scheduledTaskDefinitionReaderOverride: _ =>
+                failLiveRead
+                    ? (false, string.Empty, "Access denied reading Task XML")
+                    : (true, currentLiveXml, string.Empty));
+
+        var taskThreat = new MalwareThreatItem
+        {
+            Stage = MalwareScanStage.PersistenceAndService,
+            ThreatName = "Trojan.Persistence.MaliciousCommand",
+            Severity = ThreatSeverity.Critical,
+            RiskScore = 90,
+            TargetPath = @"C:\Windows\System32\Tasks",
+            EntryName = taskPath,
+            AssociatedFilePath = taskBin,
+            AssociatedFileSha256 = taskBinSha256,
+            ScheduledTaskDefinitionSha256 = scannedHash,
+            ActionType = RemediationActionType.DeleteScheduledTask
+        };
+
+        // 1. Only <Arguments> changed since scan -> 0 delete calls, 0 quarantine calls, must require re-scan!
+        var changedRes = remediation.CureSingleItem(taskThreat);
+        Assert.Equal(0, deleteCalls);
+        Assert.False(changedRes.Success);
+        Assert.Equal(false, changedRes.ScheduledTaskDeleted);
+        Assert.Contains("재검사", changedRes.Message, StringComparison.Ordinal);
+        Assert.True(File.Exists(taskBin));
+        Assert.Empty(quarantine.ListEntries());
+
+        // 2. Live definition read failure -> 0 delete calls, 0 quarantine calls, must require re-scan!
+        failLiveRead = true;
+        var readFailRes = remediation.CureSingleItem(taskThreat);
+        Assert.Equal(0, deleteCalls);
+        Assert.False(readFailRes.Success);
+        Assert.Equal(false, readFailRes.ScheduledTaskDeleted);
+        Assert.Contains("재검사", readFailRes.Message, StringComparison.Ordinal);
+        Assert.True(File.Exists(taskBin));
+        Assert.Empty(quarantine.ListEntries());
+
+        // 3. Missing scan-time ScheduledTaskDefinitionSha256 -> 0 delete calls, 0 quarantine calls!
+        failLiveRead = false;
+        currentLiveXml = scannedXml;
+        var missingHashRes = remediation.CureSingleItem(taskThreat with { ScheduledTaskDefinitionSha256 = null });
+        Assert.Equal(0, deleteCalls);
+        Assert.False(missingHashRes.Success);
+        Assert.Equal(false, missingHashRes.ScheduledTaskDeleted);
+        Assert.Contains("재검사", missingHashRes.Message, StringComparison.Ordinal);
+        Assert.True(File.Exists(taskBin));
+        Assert.Empty(quarantine.ListEntries());
+
+        // 4. Exact definition match (even reformatted XML) -> deletes task & quarantines verified associated file cleanly!
+        currentLiveXml = reformattedSameXml;
+        var okRes = remediation.CureSingleItem(taskThreat);
+        Assert.Equal(1, deleteCalls);
+        Assert.True(okRes.Success);
+        Assert.Equal(true, okRes.ScheduledTaskDeleted);
+        Assert.Equal(QuarantineDisposition.RemovedImmediately, okRes.FileQuarantineDisposition);
+        Assert.Equal(SecurityActionTaken.Quarantined, okRes.ActionTaken);
+        Assert.False(File.Exists(taskBin));
+        Assert.Single(quarantine.ListEntries());
+    }
+
+    [Fact]
+    public void P2_R7_BrowserShortcutInspectionAndRepair_PreservesExternalUrlOnly_StripsOnlyRiskyFlags_AndHoldsOnTargetChange()
+    {
+        var chromeExe = @"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        var edgeExe = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+
+        // 1. Dangerous string ONLY in Description / IconLocation (NOT in Arguments) -> must NOT trigger detection!
+        var benignIconDescLnk = Path.Combine(_tempRoot, "BenignIconDesc.lnk");
+        File.WriteAllBytes(benignIconDescLnk, ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: chromeExe,
+            arguments: "--profile-directory=\"Default\"",
+            description: "Docs about --load-extension and https://company-portal.example",
+            iconLocation: @"C:\Tools\--load-extension\icon.ico"));
+        Assert.Null(MzkDeepScanner.InspectBrowserShortcutHijack(benignIconDescLnk));
+
+        // 2. External URL ONLY (e.g., intranet / school portal shortcut) -> excluded from recommended cure & NEVER modified!
+        var portalOnlyLnk = Path.Combine(_tempRoot, "SchoolPortal.lnk");
+        var portalArgs = "--profile-directory=\"Profile 1\" https://portal.university.edu/sso";
+        File.WriteAllBytes(portalOnlyLnk, ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: chromeExe,
+            arguments: portalArgs));
+
+        var portalFinding = MzkDeepScanner.InspectBrowserShortcutHijack(portalOnlyLnk);
+        Assert.NotNull(portalFinding);
+        Assert.False(portalFinding!.RecommendedForCure);
+        Assert.Equal(RemediationActionType.ManualReview, portalFinding.ActionType);
+
+        var procCtrl = new ProcessController();
+        var quarantine = new QuarantineManager(_tempRoot);
+        var auditLog = new AuditLogService(_tempRoot);
+
+        int portalWriteCalls = 0;
+        var portalRemediation = new MalwareRemediationService(
+            procCtrl,
+            quarantine,
+            auditLog,
+            _tempRoot,
+            shortcutReaderOverride: _ => (true, chromeExe, portalArgs, string.Empty),
+            shortcutWriterOverride: (_, _) => { portalWriteCalls++; return (true, string.Empty); });
+
+        // ManualReview item -> 0 write calls, original untouched
+        var portalCureRes = portalRemediation.CureSingleItem(portalFinding);
+        Assert.Equal(0, portalWriteCalls);
+        Assert.False(portalCureRes.Success);
+        // Even if forced through CleanBrowserShortcut -> 0 write calls, original untouched!
+        var forcedPortalRes = portalRemediation.CureSingleItem(portalFinding with { ActionType = RemediationActionType.CleanBrowserShortcut });
+        Assert.Equal(0, portalWriteCalls);
+        Assert.True(forcedPortalRes.Success);
+        Assert.True(File.Exists(portalOnlyLnk));
+        Assert.Empty(quarantine.ListEntries());
+
+        // 3. Normal external URL + Profile + Risky Flags -> scan records risky tokens, cure removes ONLY risky flags & values!
+        var mixedLnk = Path.Combine(_tempRoot, "WorkPortalHijacked.lnk");
+        var mixedArgs = "--profile-directory=\"Profile 2\" https://intranet.company.example/home --load-extension=\"C:\\Temp\\evil_ext\" --remote-debugging-port 9222";
+        File.WriteAllBytes(mixedLnk, ShellLinkParser.BuildSimpleShortcutBytes(
+            targetPath: chromeExe,
+            arguments: mixedArgs));
+
+        var mixedFinding = MzkDeepScanner.InspectBrowserShortcutHijack(mixedLnk);
+        Assert.NotNull(mixedFinding);
+        Assert.True(mixedFinding!.RecommendedForCure);
+        Assert.Equal(RemediationActionType.CleanBrowserShortcut, mixedFinding.ActionType);
+        Assert.Equal(chromeExe, mixedFinding.ShortcutTargetPathAtScan);
+        Assert.Equal(mixedArgs, mixedFinding.ShortcutArgumentsAtScan);
+        Assert.NotNull(mixedFinding.ShortcutRiskyTokensAtScan);
+        Assert.Equal(2, mixedFinding.ShortcutRiskyTokensAtScan!.Count);
+
+        int mixedWriteCalls = 0;
+        string? writtenMixedArgs = null;
+        var mixedRemediation = new MalwareRemediationService(
+            procCtrl,
+            quarantine,
+            auditLog,
+            _tempRoot,
+            shortcutReaderOverride: _ => (true, chromeExe, mixedArgs, string.Empty),
+            shortcutWriterOverride: (_, newArgs) =>
+            {
+                mixedWriteCalls++;
+                writtenMixedArgs = newArgs;
+                return (true, string.Empty);
+            });
+
+        var mixedCureRes = mixedRemediation.CureSingleItem(mixedFinding);
+        Assert.True(mixedCureRes.Success);
+        Assert.Equal(1, mixedWriteCalls);
+        Assert.Equal(SecurityActionTaken.RolledBack, mixedCureRes.ActionTaken);
+        Assert.Equal("--profile-directory=\"Profile 2\" https://intranet.company.example/home", writtenMixedArgs);
+        Assert.True(File.Exists(mixedLnk));
+        Assert.Empty(quarantine.ListEntries());
+
+        // 4. User changed TargetPath after scan -> 0 write calls, 0 quarantine calls, original preserved, re-scan required!
+        int targetChangedWriteCalls = 0;
+        var targetChangedRemediation = new MalwareRemediationService(
+            procCtrl,
+            quarantine,
+            auditLog,
+            _tempRoot,
+            shortcutReaderOverride: _ => (true, edgeExe, mixedArgs, string.Empty),
+            shortcutWriterOverride: (_, _) => { targetChangedWriteCalls++; return (true, string.Empty); });
+
+        var targetChangedRes = targetChangedRemediation.CureSingleItem(mixedFinding);
+        Assert.Equal(0, targetChangedWriteCalls);
+        Assert.False(targetChangedRes.Success);
+        Assert.Equal(SecurityActionTaken.Logged, targetChangedRes.ActionTaken);
+        Assert.Contains("재검사", targetChangedRes.Message, StringComparison.Ordinal);
+        Assert.True(File.Exists(mixedLnk));
+        Assert.Empty(quarantine.ListEntries());
+    }
+
+    [Fact]
+    public void P1_R8_CodeReviewFixes_ShellLinkAnsiRelativePidl_ArgPairing_PartialQuarantineAudit_AndTaskDots()
+    {
+        // 1. P1: Non-Unicode (0x1C ANSI LinkInfo) Korean path decodes via Win32 CP_ACP (NOT UTF-8 Encoding.Default!)
+        var koreanTarget = @"C:\Users\홍길동\AppData\Local\Google\Chrome\Application\chrome.exe";
+        var ansiLnkPath = Path.Combine(_tempRoot, "KoreanAnsiLink.lnk");
+        File.WriteAllBytes(ansiLnkPath, BuildAnsiOnlyLinkInfoShortcutBytes(koreanTarget, "--load-extension=\"C:\\Temp\\bad\""));
+        Assert.True(ShellLinkParser.TryParseFile(ansiLnkPath, out var parsedAnsi));
+        Assert.Equal(koreanTarget, parsedAnsi!.TargetPath);
+        var ansiFinding = MzkDeepScanner.InspectBrowserShortcutHijack(ansiLnkPath);
+        Assert.NotNull(ansiFinding);
+        Assert.Equal(koreanTarget, ansiFinding!.ShortcutTargetPathAtScan);
+
+        // 2. P1: RelativePath-only shortcut resolves against .lnk directory so scan vs COM TargetPath matches!
+        var nestedDir = Directory.CreateDirectory(Path.Combine(_tempRoot, "sub", "links")).FullName;
+        var expectedResolvedChrome = Path.GetFullPath(Path.Combine(_tempRoot, "browser", "chrome.exe"));
+        var relLnkPath = Path.Combine(nestedDir, "RelativeChrome.lnk");
+        File.WriteAllBytes(relLnkPath, BuildRelativeOnlyShortcutBytes(@"..\..\browser\chrome.exe", "--remote-debugging-port=9222"));
+        Assert.True(ShellLinkParser.TryParseFile(relLnkPath, out var parsedRel));
+        Assert.Equal(expectedResolvedChrome, parsedRel!.TargetPath);
+
+        // 3. P2: PIDL-only shortcut (LinkInfo absent, TargetPath empty in binary) resolves target via fallback ONLY when risky args exist
+        var pidlLnkPath = Path.Combine(_tempRoot, "PidlOnlyHijacked.lnk");
+        File.WriteAllBytes(pidlLnkPath, BuildPidlOnlyShortcutBytes("--profile-directory=\"Default\" --load-extension=\"C:\\Temp\\evil\""));
+        int fallbackInvocations = 0;
+        var pidlFinding = MzkDeepScanner.InspectBrowserShortcutHijack(
+            pidlLnkPath,
+            pidlTargetFallbackOverride: _ =>
+            {
+                fallbackInvocations++;
+                return (true, @"C:\Program Files\Google\Chrome\Application\chrome.exe", "--profile-directory=\"Default\" --load-extension=\"C:\\Temp\\evil\"", string.Empty);
+            });
+        Assert.Equal(1, fallbackInvocations);
+        Assert.NotNull(pidlFinding);
+        Assert.Equal(RemediationActionType.CleanBrowserShortcut, pidlFinding!.ActionType);
+
+        // Benign PIDL-only shortcut without risky args or URLs must NOT invoke COM fallback at all!
+        var benignPidlLnk = Path.Combine(_tempRoot, "PidlOnlyBenign.lnk");
+        File.WriteAllBytes(benignPidlLnk, BuildPidlOnlyShortcutBytes("--profile-directory=\"Default\""));
+        Assert.Null(MzkDeepScanner.InspectBrowserShortcutHijack(
+            benignPidlLnk,
+            pidlTargetFallbackOverride: _ =>
+            {
+                fallbackInvocations++;
+                return (true, @"C:\Program Files\Google\Chrome\Application\chrome.exe", "--profile-directory=\"Default\"", string.Empty);
+            }));
+        Assert.Equal(1, fallbackInvocations);
+
+        // 4. P2: Value-less dangerous flag immediately before user startup URL must NOT swallow the user's URL!
+        var (cleaned1, removed1) = MalwareRemediationService.SanitizeBrowserShortcutArguments(
+            "--profile-directory=\"Profile 1\" --remote-debugging-port https://portal.school.edu/sso");
+        Assert.Equal("--profile-directory=\"Profile 1\" https://portal.school.edu/sso", cleaned1);
+        Assert.Single(removed1);
+
+        var (cleaned2, removed2) = MalwareRemediationService.SanitizeBrowserShortcutArguments(
+            "-load-extension https://intranet.company.example/home --lang=ko");
+        Assert.Equal("https://intranet.company.example/home --lang=ko", cleaned2);
+        Assert.Single(removed2);
+
+        // 5. P2: Scheduled task delete FAILS while associated file IS quarantined (RemovedImmediately) -> audit must record Quarantined!
+        var taskBin = Path.Combine(_tempRoot, "task_partial_fail.exe");
+        File.WriteAllText(taskBin, "malicious-task-binary");
+        var taskBinSha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(taskBin)));
+        var taskXml = $"""
+            <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <Actions Context="Author"><Exec><Command>{taskBin}</Command><Arguments>-enc AAAA</Arguments></Exec></Actions>
+            </Task>
+            """;
+        var taskHash = PersistenceMonitor.ComputeScheduledTaskDefinitionSha256(@"\Vendor\PartialFailTask", taskXml);
+
+        var quarantine = new QuarantineManager(_tempRoot);
+        var auditLog = new AuditLogService(_tempRoot);
+        var remediation = new MalwareRemediationService(
+            new ProcessController(),
+            quarantine,
+            auditLog,
+            _tempRoot,
+            commandRunnerOverride: (_, _) => (false, "ACCESS_DENIED"),
+            scheduledTaskDefinitionReaderOverride: _ => (true, taskXml, string.Empty));
+
+        var partialRes = remediation.CureSingleItem(new MalwareThreatItem
+        {
+            Stage = MalwareScanStage.PersistenceAndService,
+            ThreatName = "Trojan.Persistence.PartialFail",
+            Severity = ThreatSeverity.Critical,
+            RiskScore = 90,
+            TargetPath = @"C:\Windows\System32\Tasks",
+            EntryName = @"\Vendor\PartialFailTask",
+            AssociatedFilePath = taskBin,
+            AssociatedFileSha256 = taskBinSha,
+            ScheduledTaskDefinitionSha256 = taskHash,
+            ActionType = RemediationActionType.DeleteScheduledTask
+        });
+
+        Assert.False(partialRes.Success);
+        Assert.Equal(false, partialRes.ScheduledTaskDeleted);
+        Assert.Equal(QuarantineDisposition.RemovedImmediately, partialRes.FileQuarantineDisposition);
+        Assert.Equal(SecurityActionTaken.Quarantined, partialRes.ActionTaken);
+        Assert.False(File.Exists(taskBin));
+        Assert.Single(quarantine.ListEntries());
+        Assert.Equal(SecurityActionTaken.Quarantined, auditLog.LoadRecentEvents(5).Single().ActionTaken);
+
+        // 6. P3: Task name containing consecutive dots ("App..Updater") is NOT falsely rejected as path traversal, while "\..\evil" IS rejected
+        PersistenceMonitor.TryReadScheduledTaskXmlFromDisk(@"\Vendor\App..Updater", out _, out var dotNameErr);
+        Assert.DoesNotContain("유효하지 않은", dotNameErr, StringComparison.Ordinal);
+        Assert.False(PersistenceMonitor.TryReadScheduledTaskXmlFromDisk(@"\Vendor\..\OutsideTask", out _, out var traversalErr));
+        Assert.Contains("유효하지 않은", traversalErr, StringComparison.Ordinal);
+    }
+
+    private static byte[] BuildAnsiOnlyLinkInfoShortcutBytes(string ansiTargetPath, string arguments)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        byte[] clsid = { 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+        uint flags = 0x02u | 0x20u | 0x80u; // HasLinkInfo | HasArguments | IsUnicode
+        bw.Write(0x4Cu);
+        bw.Write(clsid);
+        bw.Write(flags);
+        bw.Write(new byte[76 - 24]);
+
+        var ansiBytes = ShellLinkParser.EncodeWindowsAnsi(ansiTargetPath).Concat(new byte[] { 0 }).ToArray();
+        const uint headerSize = 0x1Cu; // 28-byte ANSI-only LinkInfo header (no Unicode offsets!)
+        uint localBasePathOffset = headerSize;
+        uint commonSuffixOffset = localBasePathOffset + (uint)ansiBytes.Length;
+        uint linkInfoSize = commonSuffixOffset + 1;
+        bw.Write(linkInfoSize);
+        bw.Write(headerSize);
+        bw.Write(1u); // VolumeIDAndLocalBasePath
+        bw.Write(0u);
+        bw.Write(localBasePathOffset);
+        bw.Write(0u);
+        bw.Write(commonSuffixOffset);
+        bw.Write(ansiBytes);
+        bw.Write((byte)0);
+
+        bw.Write((ushort)arguments.Length);
+        bw.Write(Encoding.Unicode.GetBytes(arguments));
+        bw.Write(0u);
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    private static byte[] BuildRelativeOnlyShortcutBytes(string relativePath, string arguments)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        byte[] clsid = { 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+        uint flags = 0x08u | 0x20u | 0x80u; // HasRelativePath | HasArguments | IsUnicode
+        bw.Write(0x4Cu);
+        bw.Write(clsid);
+        bw.Write(flags);
+        bw.Write(new byte[76 - 24]);
+
+        bw.Write((ushort)relativePath.Length);
+        bw.Write(Encoding.Unicode.GetBytes(relativePath));
+        bw.Write((ushort)arguments.Length);
+        bw.Write(Encoding.Unicode.GetBytes(arguments));
+        bw.Write(0u);
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    private static byte[] BuildPidlOnlyShortcutBytes(string arguments)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        byte[] clsid = { 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+        uint flags = 0x01u | 0x20u | 0x80u; // HasLinkTargetIDList | HasArguments | IsUnicode (no LinkInfo!)
+        bw.Write(0x4Cu);
+        bw.Write(clsid);
+        bw.Write(flags);
+        bw.Write(new byte[76 - 24]);
+
+        // Minimal dummy IDList (2-byte terminal 0x0000)
+        bw.Write((ushort)2);
+        bw.Write((ushort)0);
+
+        bw.Write((ushort)arguments.Length);
+        bw.Write(Encoding.Unicode.GetBytes(arguments));
+        bw.Write(0u);
+        bw.Flush();
+        return ms.ToArray();
     }
 }

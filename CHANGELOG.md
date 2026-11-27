@@ -9,6 +9,17 @@
 
 ---
 
+## [1.2.3] - 2026-11-27
+
+### 수정 (Fixed)
+- **예약 작업 삭제 전 정의 해시(SHA-256) 검증 및 부분 성공 감사 정합성 (`P1`/`P2`/`P3`, `PersistenceMonitor` · `SecurityModels` · `MalwareScanModels` · `MzkDeepScanner` · `MalwareRemediationService`)**: 스캔 시 예약 작업 전체 경로와 등록 XML 정의(실행 경로·인자·계정·트리거·설정)를 정규화 직렬화한 `ScheduledTaskDefinitionSha256`을 저장. 치료 직전 현재 정의를 재조회해 해시 누락·조회 실패·불일치(예: 인자/트리거/계정 변경) 시 `schtasks /Delete`와 연계 파일 격리를 모두 보류하고 재검사를 안내하며, 일치 시에만 삭제를 시도하고 작업 삭제 결과(`ScheduledTaskDeleted`)와 연계 파일 격리 결과를 분리 기록. 작업/서비스 명령이 실패했더라도 연계 파일이 실제 격리·제거(`RemovedImmediately`)됐다면 감사 로그 `ActionTaken`에 `Quarantined`를 반영하고, 작업명 경로 순회 검사를 세그먼트 단위(`.`/`..`)로 정밀화해 `App..Updater` 같은 정상 이름의 오차단을 방지.
+- **브라우저 바로가기 구조화 파싱 · 한글 ANSI/상대경로/PIDL 지원 · 외부 URL 전용 보존 (`P1`/`P2`, `ShellLinkParser` · `MalwareScanModels` · `MzkDeepScanner` · `MalwareRemediationService`)**: `[MS-SHLLINK]` 바이너리 파서(`ShellLinkParser`)에서 Win32 `MultiByteToWideChar(CP_ACP)`로 한글 ANSI 경로 깨짐을 방지하고 `RelativePath`를 `.lnk` 기준 절대경로로 정규화하며, PIDL 전용 바로가기에서 위험 인자·URL 후보가 있을 때만 COM으로 대상을 보완 조회. 외부 URL만 있는 사내/학교 포털 바로가기는 원본을 보존하고 자동 치료 권장에서 제외(`ManualReview`, `RecommendedForCure = false`)하며, 값 없는 위험 플래그(`--remote-debugging-port`·`-load-extension` 등) 뒤의 사용자 URL을 오인 삭제하지 않고 위험 플래그와 유효 값만 제거(검사 후 대상/인자 변경 시 저장 0회 보류).
+
+### 테스트 (Tests)
+- `ManualRemediationAndFailoverRegressionTests` 3종 추가 (예약 작업 인자 변경·조회 실패·해시 누락 시 삭제 0회·격리 0회 및 일치 시 정상 치료, `.lnk` 설명/아이콘 오탐 방지·외부 URL 전용 보존·URL+프로필+위험 인자 정밀 제거·목적지 변경 시 저장 0회, 한글 ANSI/상대경로/PIDL `.lnk`·값 없는 위험 플래그 뒤 URL 보존·작업 실패+연계 파일 격리 감사 일치·`App..Updater` 작업명 허용 — 전체 **83 / 83 통과**).
+
+---
+
 ## [1.2.2] - 2026-11-27
 
 ### 수정 (Fixed)
@@ -115,7 +126,8 @@
 
 ---
 
-[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/kjm0719/AegisSentinel/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/kjm0719/AegisSentinel/compare/v1.1.2...v1.2.0

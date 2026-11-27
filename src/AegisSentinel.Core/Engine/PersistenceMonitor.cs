@@ -1,4 +1,8 @@
 using System.Management;
+using System.Security.Cryptography;
+using System.Text;
+using System.Xml;
+using System.Xml.Linq;
 using Microsoft.Win32;
 using AegisSentinel.Core.Models;
 using AegisSentinel.Core.Services;
@@ -484,17 +488,166 @@ public sealed class PersistenceMonitor : IDisposable
                 }
 
                 if (++count > 250) break;
+                var fullTaskPath = NormalizeScheduledTaskPath(relPath);
                 var cmd = TryExtractTaskXmlCommand(file);
                 var exe = ExtractExecutablePath(cmd);
+                var defSha256 = TryComputeScheduledTaskDefinitionSha256FromFile(fullTaskPath, file);
                 target[$"ScheduledTask::{relPath}"] = new PersistenceEntry(
                     tasksRoot,
                     "Scheduled-Task",
-                    relPath,
+                    fullTaskPath,
                     string.IsNullOrWhiteSpace(cmd) ? file : cmd,
-                    exe);
+                    exe,
+                    DefinitionSha256: string.IsNullOrEmpty(defSha256) ? null : defSha256);
             }
         }
         catch { }
+    }
+
+    public static string NormalizeScheduledTaskPath(string taskName)
+    {
+        if (string.IsNullOrWhiteSpace(taskName)) return string.Empty;
+        var trimmed = taskName.Trim().Replace('/', '\\');
+        return trimmed.StartsWith('\\') ? trimmed : "\\" + trimmed;
+    }
+
+    /// <summary>
+    /// Canonically serializes a Windows Scheduled Task XML definition (preserving Actions/Command/Arguments,
+    /// Principals/UserId/RunLevel, Triggers, Settings, and normalized full task path while normalizing
+    /// insignificant XML formatting/attribute ordering) and returns its SHA-256 hex digest.
+    /// </summary>
+    public static string ComputeScheduledTaskDefinitionSha256(string taskName, string taskDefinitionXml)
+    {
+        var normalizedPath = NormalizeScheduledTaskPath(taskName);
+        if (string.IsNullOrWhiteSpace(normalizedPath) || string.IsNullOrWhiteSpace(taskDefinitionXml))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            var settings = new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                IgnoreComments = true,
+                IgnoreWhitespace = true
+            };
+
+            using var sr = new StringReader(taskDefinitionXml.TrimStart('\uFEFF', ' ', '\t', '\r', '\n'));
+            using var reader = XmlReader.Create(sr, settings);
+            var doc = XDocument.Load(reader, LoadOptions.None);
+            if (doc.Root is null)
+            {
+                return string.Empty;
+            }
+
+            var canonicalRoot = CanonicalizeXmlElement(doc.Root);
+            var canonicalXml = canonicalRoot.ToString(SaveOptions.DisableFormatting);
+            var payload = $"TASK|{normalizedPath.ToUpperInvariant()}\n{canonicalXml}";
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload)));
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static XElement CanonicalizeXmlElement(XElement element)
+    {
+        var sortedAttrs = element.Attributes()
+            .OrderBy(a => a.Name.NamespaceName, StringComparer.Ordinal)
+            .ThenBy(a => a.Name.LocalName, StringComparer.Ordinal)
+            .Select(a => new XAttribute(a.Name, a.Value));
+
+        var children = new List<object>();
+        foreach (var node in element.Nodes())
+        {
+            switch (node)
+            {
+                case XElement childEl:
+                    children.Add(CanonicalizeXmlElement(childEl));
+                    break;
+                case XText textNode:
+                    if (!string.IsNullOrWhiteSpace(textNode.Value))
+                    {
+                        children.Add(new XText(textNode.Value.Trim()));
+                    }
+                    break;
+            }
+        }
+
+        var canonical = new XElement(element.Name, sortedAttrs);
+        if (children.Count > 0)
+        {
+            canonical.Add(children);
+        }
+        return canonical;
+    }
+
+    public static string TryComputeScheduledTaskDefinitionSha256FromFile(string fullTaskPath, string taskFilePath)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(taskFilePath) || !File.Exists(taskFilePath))
+            {
+                return string.Empty;
+            }
+            var xml = File.ReadAllText(taskFilePath);
+            return ComputeScheduledTaskDefinitionSha256(fullTaskPath, xml);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    public static bool TryReadScheduledTaskXmlFromDisk(string taskName, out string xml, out string error)
+    {
+        xml = string.Empty;
+        error = string.Empty;
+        var normalized = NormalizeScheduledTaskPath(taskName);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            error = "예약 작업 이름이 비어 있습니다.";
+            return false;
+        }
+
+        var rel = normalized.TrimStart('\\');
+        if (Path.IsPathRooted(rel) ||
+            rel.Split('\\', StringSplitOptions.RemoveEmptyEntries).Any(seg => seg is "." or ".."))
+        {
+            error = "유효하지 않은 예약 작업 경로입니다.";
+            return false;
+        }
+
+        try
+        {
+            var tasksRoot = Path.GetFullPath(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "System32",
+                "Tasks"));
+            var fullFile = Path.GetFullPath(Path.Combine(tasksRoot, rel));
+            if (!fullFile.StartsWith(tasksRoot + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "예약 작업 경로 경계 위반입니다.";
+                return false;
+            }
+
+            if (!File.Exists(fullFile))
+            {
+                error = "예약 작업 정의 파일을 찾을 수 없습니다.";
+                return false;
+            }
+
+            xml = File.ReadAllText(fullFile);
+            return !string.IsNullOrWhiteSpace(xml);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
     }
 
     public static string TryExtractTaskXmlCommand(string taskFilePath)

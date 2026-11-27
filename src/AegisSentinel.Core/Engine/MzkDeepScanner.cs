@@ -527,6 +527,7 @@ public sealed class MzkDeepScanner
             {
                 bool isTask = entry.Category.Equals("Scheduled-Task", StringComparison.OrdinalIgnoreCase);
                 var runAssoc = File.Exists(exe) && !QuarantineManager.IsProtectedSystemOrSelfPath(exe) ? exe : null;
+                var taskFullPath = isTask ? PersistenceMonitor.NormalizeScheduledTaskPath(entry.Name) : entry.Name;
                 findings.Add(new MalwareThreatItem
                 {
                     Stage = MalwareScanStage.PersistenceAndService,
@@ -535,9 +536,10 @@ public sealed class MzkDeepScanner
                     Severity = (hasSuspiciousCmd || isMaliciousFile) ? ThreatSeverity.Critical : ThreatSeverity.High,
                     RiskScore = (hasSuspiciousCmd || isMaliciousFile) ? 90 : 75,
                     TargetPath = entry.SourceLocation,
-                    EntryName = entry.Name,
+                    EntryName = taskFullPath,
                     AssociatedFilePath = runAssoc,
                     AssociatedFileSha256 = runAssoc is not null ? ComputeFileSha256Safe(runAssoc) : null,
+                    ScheduledTaskDefinitionSha256 = isTask ? entry.DefinitionSha256 : null,
                     SignatureLabel = entrySigLabel,
                     Description = $"[{entry.Category}] {entry.Name} → {entry.Value}",
                     ActionType = isTask ? RemediationActionType.DeleteScheduledTask : RemediationActionType.RollbackRegistryOrStartup,
@@ -785,74 +787,132 @@ public sealed class MzkDeepScanner
         return scanned;
     }
 
-    public static MalwareThreatItem? InspectBrowserShortcutHijack(string lnkPath)
+    public static MalwareThreatItem? InspectBrowserShortcutHijack(
+        string lnkPath,
+        Func<string, (bool Success, string TargetPath, string Arguments, string Error)>? shortcutReaderOverride = null,
+        Func<string, (bool Success, string TargetPath, string Arguments, string Error)>? pidlTargetFallbackOverride = null)
     {
         try
         {
-            if (!File.Exists(lnkPath)) return null;
-            var raw = File.ReadAllBytes(lnkPath);
-            if (raw.Length < 76 || raw[0] != 0x4C || raw[1] != 0x00) return null;
+            if (string.IsNullOrWhiteSpace(lnkPath) || !File.Exists(lnkPath)) return null;
 
-            // Decode ASCII + BOTH even-aligned AND odd-aligned UTF-16LE (fixes 50% odd-offset LNK StringData miss!)
-            var sb = new StringBuilder(raw.Length * 2);
-            sb.Append(Encoding.ASCII.GetString(raw));
-            sb.Append('\n');
-            sb.Append(Encoding.Unicode.GetString(raw));
-            if (raw.Length > 1)
+            string targetPath;
+            string arguments;
+            if (shortcutReaderOverride is not null)
             {
-                sb.Append('\n');
-                sb.Append(Encoding.Unicode.GetString(raw, 1, raw.Length - 1));
+                var (ok, t, a, _) = shortcutReaderOverride(lnkPath);
+                if (!ok) return null;
+                targetPath = t?.Trim() ?? string.Empty;
+                arguments = a?.Trim() ?? string.Empty;
             }
-            var combined = sb.ToString();
-
-            bool targetsBrowser = BrowserExecutableNames.Any(b => combined.Contains(b, StringComparison.OrdinalIgnoreCase));
-            if (!targetsBrowser) return null;
-
-            bool hasDangerousFlag = combined.Contains("--load-extension", StringComparison.OrdinalIgnoreCase) ||
-                                    combined.Contains("--remote-debugging-port", StringComparison.OrdinalIgnoreCase) ||
-                                    combined.Contains("--proxy-server", StringComparison.OrdinalIgnoreCase);
-
-            // Legitimate Chrome/Edge PWA shortcuts use --app-id= or --app= (skip URL check unless dangerous flags are present)
-            bool isLegitimatePwaShortcut =
-                !hasDangerousFlag &&
-                (lnkPath.Contains(@"\Chrome Apps\", StringComparison.OrdinalIgnoreCase) ||
-                 combined.Contains("--app-id=", StringComparison.OrdinalIgnoreCase) ||
-                 combined.Contains("--app=", StringComparison.OrdinalIgnoreCase));
-
-            string? badUrl = null;
-            if (!isLegitimatePwaShortcut)
+            else
             {
-                foreach (Match m in UrlArgRegex.Matches(combined))
+                if (!ShellLinkParser.TryParseFile(lnkPath, out var parsed) || parsed is null)
                 {
-                    if (!IsTrustedOfficialBrowserUrl(m.Value))
+                    return null;
+                }
+                targetPath = parsed.TargetPath;
+                arguments = parsed.Arguments;
+
+                // Fast path: if there are no command-line arguments, no shortcut argument injection exists.
+                if (string.IsNullOrWhiteSpace(arguments)) return null;
+
+                // Some real Windows shortcuts store TargetPath only inside LinkTargetIDList (PIDL) without LinkInfo.
+                // Resolve TargetPath via COM ONLY when Arguments actually contains risky flags or URLs.
+                if (string.IsNullOrWhiteSpace(targetPath))
+                {
+                    var (_, candidateRisky) = MalwareRemediationService.SanitizeBrowserShortcutArguments(arguments);
+                    bool hasCandidateUrl = UrlArgRegex.IsMatch(arguments);
+                    if (candidateRisky.Count == 0 && !hasCandidateUrl)
                     {
-                        badUrl = m.Value;
-                        break;
+                        return null;
+                    }
+
+                    var resolver = pidlTargetFallbackOverride ?? MalwareRemediationService.ReadShortcutViaComStatic;
+                    var (comOk, comTarget, comArgs, _) = resolver(lnkPath);
+                    if (!comOk || string.IsNullOrWhiteSpace(comTarget))
+                    {
+                        return null;
+                    }
+                    targetPath = comTarget.Trim();
+                    if (!string.IsNullOrWhiteSpace(comArgs))
+                    {
+                        arguments = comArgs.Trim();
                     }
                 }
             }
 
-            if (!hasDangerousFlag && badUrl is null) return null;
+            if (string.IsNullOrWhiteSpace(targetPath)) return null;
 
-            var detail = hasDangerousFlag
-                ? "브라우저 바로가기(.lnk)에 악성 확장 로드/원격 디버깅/프록시 인자가 주입되어 있습니다."
-                : $"브라우저 바로가기(.lnk)에 외부 강제 접속 URL({badUrl})이 주입되어 있습니다(MZK 대표 하이재킹 유형).";
-
-            return new MalwareThreatItem
+            var targetLeaf = Path.GetFileName(targetPath);
+            if (string.IsNullOrWhiteSpace(targetLeaf) ||
+                !BrowserExecutableNames.Any(b => targetLeaf.Equals(b, StringComparison.OrdinalIgnoreCase)))
             {
-                Stage = MalwareScanStage.BrowserHijack,
-                ThreatName = "Hijacker.Browser.ShortcutInjection",
-                CategoryLabel = "브라우저 바로가기 변조",
-                Severity = hasDangerousFlag ? ThreatSeverity.Critical : ThreatSeverity.High,
-                RiskScore = hasDangerousFlag ? 90 : 80,
-                TargetPath = lnkPath,
-                TargetFileExistedAtScan = true,
-                Sha256 = ComputeFileSha256Safe(lnkPath),
-                SignatureLabel = "바로가기(.lnk) 분석",
-                Description = detail,
-                ActionType = RemediationActionType.CleanBrowserShortcut,
-                RecommendedForCure = true
-            };
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(arguments)) return null;
+
+            // Inspect ONLY actual command-line Arguments (never icon path or description strings!).
+            var (_, riskyTokens) = MalwareRemediationService.SanitizeBrowserShortcutArguments(arguments);
+            if (riskyTokens.Count > 0)
+            {
+                return new MalwareThreatItem
+                {
+                    Stage = MalwareScanStage.BrowserHijack,
+                    ThreatName = "Hijacker.Browser.ShortcutInjection",
+                    CategoryLabel = "브라우저 바로가기 변조",
+                    Severity = ThreatSeverity.Critical,
+                    RiskScore = 90,
+                    TargetPath = lnkPath,
+                    TargetFileExistedAtScan = true,
+                    Sha256 = ComputeFileSha256Safe(lnkPath),
+                    ShortcutTargetPathAtScan = targetPath,
+                    ShortcutArgumentsAtScan = arguments,
+                    ShortcutRiskyTokensAtScan = riskyTokens.ToList(),
+                    SignatureLabel = "바로가기(.lnk) 구조 분석",
+                    Description = $"브라우저 바로가기(.lnk) 실행 인자에 위험 플래그({string.Join(", ", riskyTokens)})가 주입되어 있습니다.",
+                    ActionType = RemediationActionType.CleanBrowserShortcut,
+                    RecommendedForCure = true
+                };
+            }
+
+            // External URL alone (without dangerous flags) may be a user-created intranet/school/portal shortcut:
+            // preserve original and exclude from recommended cure (ManualReview only).
+            bool isPwaShortcut =
+                lnkPath.Contains(@"\Chrome Apps\", StringComparison.OrdinalIgnoreCase) ||
+                arguments.Contains("--app-id=", StringComparison.OrdinalIgnoreCase) ||
+                arguments.Contains("--app=", StringComparison.OrdinalIgnoreCase);
+
+            if (!isPwaShortcut)
+            {
+                foreach (Match m in UrlArgRegex.Matches(arguments))
+                {
+                    if (!IsTrustedOfficialBrowserUrl(m.Value))
+                    {
+                        return new MalwareThreatItem
+                        {
+                            Stage = MalwareScanStage.BrowserHijack,
+                            ThreatName = "Info.Browser.ShortcutExternalUrl",
+                            CategoryLabel = "브라우저 바로가기 외부 URL(수동 확인)",
+                            Severity = ThreatSeverity.Info,
+                            RiskScore = 20,
+                            TargetPath = lnkPath,
+                            TargetFileExistedAtScan = true,
+                            Sha256 = ComputeFileSha256Safe(lnkPath),
+                            ShortcutTargetPathAtScan = targetPath,
+                            ShortcutArgumentsAtScan = arguments,
+                            ShortcutRiskyTokensAtScan = Array.Empty<string>(),
+                            SignatureLabel = "바로가기(.lnk) 구조 분석",
+                            Description = $"브라우저 바로가기(.lnk) 실행 인자에 외부 URL({m.Value})이 포함되어 있습니다. 정상 포털/학교 바로가기일 수 있어 자동 치료에서 제외했습니다.",
+                            ActionType = RemediationActionType.ManualReview,
+                            RecommendedForCure = false
+                        };
+                    }
+                }
+            }
+
+            return null;
         }
         catch
         {

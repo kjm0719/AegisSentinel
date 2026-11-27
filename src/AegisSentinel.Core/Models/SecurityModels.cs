@@ -461,7 +461,8 @@ public sealed record PersistenceEntry(
     string Name,
     string Value,
     string ExtractedExecutablePath,
-    SignatureInfo? Signature = null);
+    SignatureInfo? Signature = null,
+    string? DefinitionSha256 = null);
 
 public sealed record ActiveNetworkConnection(
     int ProcessId,
